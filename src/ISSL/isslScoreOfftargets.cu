@@ -7,9 +7,7 @@ bioRxiv 2020.02.14.950261; doi: https://doi.org/10.1101/2020.02.14.950261
 
 To compile:
 
-nvcc -o isslScoreOfftargets isslScoreOfftargets.cu -Iinclude/ -O3 -std=c++11 -Xcompiler -fopenmp -Xcompiler -mpopcnt -Xcompiler -Iparallel_hashmap
-
-Consider adding `-arch=native` and `-Xcompiler -march=native` for maximum performance on your machine's specific architecture (GPU and CPU).
+g++ -o isslScoreOfftargets isslScoreOfftargets.cpp -O3 -std=c++11 -fopenmp -mpopcnt -Iparallel_hashmap
 
 */
 
@@ -42,7 +40,6 @@ using namespace std;
 size_t seqLength, seqCount, sliceWidth, sliceCount, offtargetsCount, scoresCount;
 
 __managed__ uint8_t nucleotideIndex[256];
-
 vector<char> signatureIndex(4);
 enum ScoreMethod { unknown = 0, mit = 1, cfd = 2, mitAndCfd = 3, mitOrCfd = 4, avgMitCfd = 5 };
 
@@ -305,17 +302,12 @@ int main(int argc, char **argv)
     }
     size_t queryCount = fileSize / seqLineLength;
     fp = fopen(argv[2], "rb");
-
-    uint8_t* queryDataSet;
-    cudaMallocManaged(&queryDataSet, fileSize);
-
-    uint64_t* querySignatures;
-    cudaMallocManaged(&querySignatures, queryCount);
-
+    vector<char> queryDataSet(fileSize);
+    vector<uint64_t> querySignatures(queryCount);
     vector<double> querySignatureMitScores(queryCount);
     vector<double> querySignatureCfdScores(queryCount);
 
-    if (fread(queryDataSet, fileSize, 1, fp) < 1) {
+    if (fread(queryDataSet.data(), fileSize, 1, fp) < 1) {
         fprintf(stderr, "Failed to read in query file.\n");
         exit(1);
     }
@@ -333,11 +325,50 @@ int main(int argc, char **argv)
         }
     }
 #else
-    // TODO: Grid and block size
-    sequenceToSignatureCUDA<<<1, 1>>>(queryCount, seqLength, queryDataSet, querySignatures);
+    printf("Using CUDA\n");
+    int blockSize = 256; // This is a typical choice. It could be 128, 512, or 1024 depending on the GPU.
+    int gridSize = (seqLength + blockSize - 1) / blockSize; // N is the size of your data
+
+    uint64_t required_vram = ((seqLength + 1) * queryCount * sizeof(uint8_t)) + (queryCount * sizeof(uint64_t));
+
+    printf("Required VRAM: %d\n", required_vram);
+
+    uint64_t usable_vram = 2048*1024;
+
+    printf("Usable VRAM: %d\n", usable_vram);
+
+    uint8_t *d_queryDataSet;
+    uint64_t *d_querySignatures;
+
+    // Calculate the amount of data we can store in the VRAM
+    uint64_t max_query_count = usable_vram / ((seqLength + 1) * sizeof(uint8_t) + sizeof(uint64_t));
+
+    printf("Max query count: %d\n", max_query_count);
+
+    // Allocate the VRAM
+    cudaMalloc(&d_queryDataSet, max_query_count * (seqLength + 1) * sizeof(uint8_t));
+    cudaMalloc(&d_querySignatures, max_query_count * sizeof(uint64_t));
+
+    // Calculate the signatures in batches
+    for (size_t i = 0; i < queryCount; i += max_query_count) {
+        size_t query_count = max_query_count;
+        if (i + max_query_count > queryCount) {
+            query_count = queryCount - i;
+        }
+
+        // Copy the query data to the VRAM
+        cudaMemcpy(d_queryDataSet, &queryDataSet[i * (seqLength + 1)], query_count * (seqLength + 1) * sizeof(uint8_t), cudaMemcpyHostToDevice);
+
+        // Calculate the signatures
+        sequenceToSignatureCUDA<<<blockSize, gridSize>>>(query_count, seqLength, d_queryDataSet, d_querySignatures);
+        cudaDeviceSynchronize();
+
+        // Copy the signatures back to the host
+        cudaMemcpy(&querySignatures[i], d_querySignatures, query_count * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    }
     cudaDeviceSynchronize();
+
 #endif
-    cudaFree(queryDataSet);
 
     /** Begin scoring */
     #pragma omp parallel
@@ -349,7 +380,7 @@ int main(int argc, char **argv)
 
         /** For each candidate guide */
         #pragma omp for
-        for (size_t searchIdx = 0; searchIdx < queryCount; searchIdx++) {
+        for (size_t searchIdx = 0; searchIdx < querySignatures.size(); searchIdx++) {
 
             auto searchSignature = querySignatures[searchIdx];
 
@@ -546,7 +577,7 @@ int main(int argc, char **argv)
     }
     
     /** Print global scores to stdout */
-    for (size_t searchIdx = 0; searchIdx < queryCount; searchIdx++) {
+    for (size_t searchIdx = 0; searchIdx < querySignatures.size(); searchIdx++) {
         auto querySequence = signatureToSequence(querySignatures[searchIdx]);
         printf("%s\t", querySequence.c_str());
         if (calcMit) 
@@ -560,8 +591,6 @@ int main(int argc, char **argv)
             printf("-1\n");
             
     }
-
-    cudaFree(querySignatures);
 
     return 0;
 }
