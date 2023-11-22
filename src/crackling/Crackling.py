@@ -259,6 +259,8 @@ def Crackling(configMngr):
 
         completedPercent = round(completedSizeBytes / totalSizeBytes * 100.0, 3)
         printer(f'\tExtracted from {completedPercent}% of input')
+        
+        os.unlink(parsedFile.name)
 
     # Write header line for output file
     with open(configMngr['output']['file'], 'a+') as fOpen:
@@ -268,7 +270,6 @@ def Crackling(configMngr):
         csvWriter.writerow(DEFAULT_GUIDE_PROPERTIES_ORDER)
 
     # Clean up unused variables
-    os.unlink(parsedFile.name)
     del candidateGuides
     del recordedSequences
 
@@ -855,16 +856,16 @@ def Crackling(configMngr):
         ##              Clean up               ##
         #########################################
         printer('Cleaning auxiliary files')
-        for f in [
-            configMngr['rnafold']['input'],
-            configMngr['rnafold']['output'],
-            configMngr['offtargetscore']['input'],
-            configMngr['offtargetscore']['output'],
-            configMngr['bowtie2']['input'],
-            configMngr['bowtie2']['output'],
+        for x, y in [
+            ('rnafold', 'input'),
+            ('rnafold', 'output'),
+            ('offtargetscore', 'input'),
+            ('offtargetscore', 'output'),
+            ('bowtie2', 'input'),
+            ('bowtie2', 'output'),
         ]:
             try:
-                os.remove(f)
+                os.remove(configMngr[x][y])
             except:
                 pass
 
