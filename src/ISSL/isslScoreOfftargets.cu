@@ -119,10 +119,7 @@ void sequenceToSignatureCUDA(size_t queryCount, size_t seqLength, uint8_t *query
 
 }
 
-struct scoringArgs {
-            uint64_t *sliceOffset;
-            uint64_t signaturesInSlice;
-            uint64_t searchSignature;
+struct constScoringArgs {
             uint64_t *offtargets;
             uint64_t *offtargetTogglesTail;
             int maxDist;
@@ -133,28 +130,35 @@ struct scoringArgs {
             double *cfdPosPenalties;
             double *totScoreMit;
             double *totScoreCfd;
-            double maximum_sum;
             int *numOffTargetSitesScored;
             bool *checkNextSlice;
 };
 
-__global__ void scoringCUDA(struct scoringArgs* args) {
-    uint64_t *sliceOffset = args->sliceOffset;
-    uint64_t &signaturesInSlice = args->signaturesInSlice;
-    uint64_t searchSignature = args->searchSignature;
-    uint64_t *offtargets = args->offtargets;
-    uint64_t *offtargetTogglesTail = args->offtargetTogglesTail;
-    int &maxDist = args->maxDist;
-    CalcMethod &calcMethod = args->calcMethod;
-    ScoreMethod &scoreMethod = args->scoreMethod;
-    // double *precalculatedScores = args->precalculatedScores;
-    double *cfdPamPenalties = args->cfdPamPenalties;
-    double *cfdPosPenalties = args->cfdPosPenalties;
-    double &totScoreMit = *args->totScoreMit;
-    double &totScoreCfd = *args->totScoreCfd;
-    double &maximum_sum = args->maximum_sum;
-    int &numOffTargetSitesScored = *args->numOffTargetSitesScored;
-    bool &checkNextSlice = *args->checkNextSlice;
+struct variScoringArgs {
+            uint64_t *sliceOffset;
+            uint64_t signaturesInSlice;
+            uint64_t searchSignature;
+            double maximum_sum;
+};
+
+__global__ void scoringCUDA(struct constScoringArgs* c_args, struct variScoringArgs* v_args) {
+    uint64_t *offtargets = c_args->offtargets;
+    uint64_t *offtargetTogglesTail = c_args->offtargetTogglesTail;
+    int &maxDist = c_args->maxDist;
+    CalcMethod &calcMethod = c_args->calcMethod;
+    ScoreMethod &scoreMethod = c_args->scoreMethod;
+    // double *precalculatedScores = c_args->precalculatedScores;
+    double *cfdPamPenalties = c_args->cfdPamPenalties;
+    double *cfdPosPenalties = c_args->cfdPosPenalties;
+    double &totScoreMit = *c_args->totScoreMit;
+    double &totScoreCfd = *c_args->totScoreCfd;
+    int &numOffTargetSitesScored = *c_args->numOffTargetSitesScored;
+    bool &checkNextSlice = *c_args->checkNextSlice;
+
+    uint64_t *sliceOffset = v_args->sliceOffset;
+    uint64_t &signaturesInSlice = v_args->signaturesInSlice;
+    uint64_t searchSignature = v_args->searchSignature;
+    double &maximum_sum = v_args->maximum_sum;
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
@@ -576,14 +580,12 @@ int main(int argc, char **argv)
     int *d_numOffTargetSitesScored;
     cudaMalloc(&d_numOffTargetSitesScored, sizeof(int));
 
-    bool *d_checkNextSlice;
+    bool *h_checkNextSlice, *d_checkNextSlice;
+    cudaMallocHost(&h_checkNextSlice, sizeof(bool));  // Use pinned memory for faster transfers
     cudaMalloc(&d_checkNextSlice, sizeof(bool));
 
-
-    struct scoringArgs scoring_args = {
-        .sliceOffset = NULL,
-        .signaturesInSlice = 0,
-        .searchSignature = 0,
+    // 256 byte limit on the number of arguments to a kernel, so we use a struct
+    struct constScoringArgs scoring_args = {
         .offtargets = offtargets,
         .offtargetTogglesTail = d_offtargetTogglesTail,
         .maxDist = maxDist,
@@ -594,13 +596,23 @@ int main(int argc, char **argv)
         .cfdPosPenalties = d_cfdPosPenalties,
         .totScoreMit = d_totScoreMit,
         .totScoreCfd = d_totScoreCfd,
-        .maximum_sum = 0.0,
         .numOffTargetSitesScored = d_numOffTargetSitesScored,
         .checkNextSlice = d_checkNextSlice,
     };
 
-    struct scoringArgs* d_scoring_args;
-    cudaMalloc(&d_scoring_args, sizeof(struct scoringArgs));
+    struct constScoringArgs* d_scoring_args;
+    cudaMalloc(&d_scoring_args, sizeof(struct constScoringArgs));
+    cudaMemcpy(d_scoring_args, &scoring_args, sizeof(struct constScoringArgs), cudaMemcpyHostToDevice);
+
+    struct variScoringArgs slice_args = {
+        .sliceOffset = NULL,
+        .signaturesInSlice = 0,
+        .searchSignature = 0,
+        .maximum_sum = 0.0,
+    };
+
+    struct variScoringArgs* d_slice_args;
+    cudaMalloc(&d_slice_args, sizeof(struct variScoringArgs));
 
     unordered_map<uint64_t, unordered_set<uint64_t>> searchResults;
     // vector<uint64_t> offtargetToggles(numOfftargetToggles);
@@ -619,8 +631,9 @@ int main(int argc, char **argv)
         
         cudaMemset(d_numOffTargetSitesScored, 0, sizeof(int));  // int numOffTargetSitesScored = 0;
         double maximum_sum = (10000.0 - threshold*100) / threshold;
-        cudaMemset(d_checkNextSlice, 1, sizeof(bool));  // bool checkNextSlice = true;
-        bool h_checkNextSlice;
+
+        *h_checkNextSlice = true;
+        cudaMemcpy(d_checkNextSlice, h_checkNextSlice, sizeof(bool), cudaMemcpyHostToDevice);
         
         /** For each ISSL slice */
         for (size_t i = 0; i < sliceCount; i++) {
@@ -635,30 +648,25 @@ int main(int argc, char **argv)
             size_t signaturesInSlice = allSlicelistSizes[idx];
             uint64_t *sliceOffset = sliceLists[i][searchSlice];
 
-            cudaPointerAttributes attributes;
-            cudaError_t err = cudaPointerGetAttributes(&attributes, sliceOffset);
-            if (attributes.type != cudaMemoryTypeManaged) {
-                printf("type is %d, expected %d\n", attributes.type, cudaMemoryTypeManaged);
-                exit(0);
-            }
-
             /** For each off-target signature in slice */
 
-            scoring_args.sliceOffset = sliceOffset;
-            scoring_args.signaturesInSlice = signaturesInSlice;
-            scoring_args.searchSignature = searchSignature;
-            scoring_args.maximum_sum = maximum_sum;
-
-            cudaMemcpy(d_scoring_args, &scoring_args, sizeof(struct scoringArgs), cudaMemcpyHostToDevice);
+            slice_args = {
+                .sliceOffset = sliceOffset,
+                .signaturesInSlice = signaturesInSlice,
+                .searchSignature = searchSignature,
+                .maximum_sum = maximum_sum,
+            };
 
             // Check last run to see if we should continue
             cudaDeviceSynchronize();
-            cudaMemcpy(&h_checkNextSlice, d_checkNextSlice, sizeof(bool), cudaMemcpyDeviceToHost);
-            if (!h_checkNextSlice)
+            cudaMemcpy(h_checkNextSlice, d_checkNextSlice, sizeof(bool), cudaMemcpyDeviceToHost);
+            if (!*h_checkNextSlice)
                 break;
 
-            scoringCUDA<<<blockSize, gridSize>>>(d_scoring_args);
-            // Continue iterating to prepare the next run
+            cudaMemcpy(d_slice_args, &slice_args, sizeof(struct variScoringArgs), cudaMemcpyHostToDevice);
+
+            scoringCUDA<<<blockSize, gridSize>>>(d_scoring_args, d_slice_args);
+            // Continue next iteration to prepare the next run
         }
         cudaDeviceSynchronize();
 
@@ -676,14 +684,16 @@ int main(int argc, char **argv)
         printf("Processed %zu/%zu\n", searchIdx, querySignatures.size());
     }
 
+    // Free VRAM
     cudaFree(d_cfdPamPenalties);
     cudaFree(d_cfdPosPenalties);
     cudaFree(d_offtargetToggles);
     cudaFree(d_totScoreMit);
     cudaFree(d_totScoreCfd);
     cudaFree(d_numOffTargetSitesScored);
-    cudaFree(d_checkNextSlice);
     cudaFree(d_scoring_args);
+    cudaFree(d_checkNextSlice);
+    cudaFreeHost(h_checkNextSlice);
 
 #else
     #pragma omp parallel
