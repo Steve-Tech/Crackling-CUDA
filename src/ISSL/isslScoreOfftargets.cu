@@ -291,36 +291,41 @@ __global__ void scoringCUDA(struct constScoringArgs* c_args, struct variScoringA
                 }
 
                 atomicAdd(&numOffTargetSitesScored, occurrences);
+
                 /** Stop calculating global score early if possible */
-                if (scoreMethod == ScoreMethod::mitAndCfd) {
-                    if (totScoreMit > maximum_sum && totScoreCfd > maximum_sum) {
+                switch (scoreMethod) {
+                case ScoreMethod::mitAndCfd:
+                    if (totScoreMit > maximum_sum &&
+                        totScoreCfd > maximum_sum) {
                         checkNextSlice = false;
-                        break;
                     }
-                }
-                if (scoreMethod == ScoreMethod::mitOrCfd) {
-                    if (totScoreMit > maximum_sum || totScoreCfd > maximum_sum) {
+                    break;
+                case ScoreMethod::mitOrCfd:
+                    if (totScoreMit > maximum_sum ||
+                        totScoreCfd > maximum_sum) {
                         checkNextSlice = false;
-                        break;
                     }
-                }
-                if (scoreMethod == ScoreMethod::avgMitCfd) {
+                    break;
+                case ScoreMethod::avgMitCfd:
                     if (((totScoreMit + totScoreCfd) / 2.0) > maximum_sum) {
                         checkNextSlice = false;
-                        break;
                     }
-                }
-                if (scoreMethod == ScoreMethod::mit) {
+                    break;
+                case ScoreMethod::mit:
                     if (totScoreMit > maximum_sum) {
                         checkNextSlice = false;
-                        break;
                     }
-                }
-                if (scoreMethod == ScoreMethod::cfd) {
+                    break;
+                case ScoreMethod::cfd:
                     if (totScoreCfd > maximum_sum) {
                         checkNextSlice = false;
-                        break;
                     }
+                    break;
+                default:
+                    break;
+                }
+                if (!checkNextSlice) {
+                    break;
                 }
             }
         }
