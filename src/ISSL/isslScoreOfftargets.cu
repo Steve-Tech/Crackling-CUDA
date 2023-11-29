@@ -278,11 +278,19 @@ __global__ void scoringCUDA(struct constScoringArgs* c_args, struct variScoringA
                             }
                         }
                     }
-                    totScoreCfd += cfdScore * (double)occurrences;
+                    atomicAdd(&totScoreCfd, cfdScore * (double)occurrences);
                 }
-        
-                *ptrOfftargetFlag |= (1ULL << (signatureId % 64));
-                numOffTargetSitesScored += occurrences;
+
+                {
+                    // atomicOr doesn't support 64-bit, so we split it into two 32-bit halves
+                    // I don't know how expensive atomicOr is, so I've 'optimised' the second one out
+                    uint32_t bit = signatureId % 64;
+                    uint32_t is_high = bit > 31;
+                    uint32_t flag32 = 1ULL << (bit - (is_high * 32));
+                    atomicOr((uint32_t*)ptrOfftargetFlag + is_high, flag32);
+                }
+
+                atomicAdd(&numOffTargetSitesScored, occurrences);
                 /** Stop calculating global score early if possible */
                 if (scoreMethod == ScoreMethod::mitAndCfd) {
                     if (totScoreMit > maximum_sum && totScoreCfd > maximum_sum) {
@@ -621,7 +629,7 @@ int main(int argc, char **argv)
 
     /** For each candidate guide */
     // TODO: Remove starting offset before finishing
-    for (size_t searchIdx = querySignatures.size() - 32; searchIdx < querySignatures.size(); searchIdx++) {
+    for (size_t searchIdx = querySignatures.size() - 256; searchIdx < querySignatures.size(); searchIdx++) {
 
         auto searchSignature = querySignatures[searchIdx];
 
@@ -634,7 +642,7 @@ int main(int argc, char **argv)
 
         *h_checkNextSlice = true;
         cudaMemcpy(d_checkNextSlice, h_checkNextSlice, sizeof(bool), cudaMemcpyHostToDevice);
-        
+
         /** For each ISSL slice */
         for (size_t i = 0; i < sliceCount; i++) {
             uint64_t sliceMask = sliceLimit - 1;
@@ -681,7 +689,7 @@ int main(int argc, char **argv)
         // memset(offtargetToggles.data(), 0, sizeof(uint64_t)*offtargetToggles.size());
         cudaMemset(d_offtargetToggles, 0, numOfftargetToggles * sizeof(uint64_t));
 
-        printf("Processed %zu/%zu\n", searchIdx, querySignatures.size());
+        // printf("Processed %zu/%zu\n", searchIdx, querySignatures.size());
     }
 
     // Free VRAM
