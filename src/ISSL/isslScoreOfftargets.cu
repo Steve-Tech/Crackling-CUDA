@@ -441,20 +441,44 @@ int main(int argc, char **argv)
     
     /** Load in all of the off-target sites */
     uint64_t* offtargets;
-    cudaMallocManaged(&offtargets, offtargetsCount * sizeof(uint64_t));
-    if (fread(offtargets, sizeof(uint64_t), offtargetsCount, fp) == 0) {
-        fprintf(stderr, "Error reading index: loading off-target sequences failed\n");
-        return 1;
+    // cudaMallocManaged(&offtargets, offtargetsCount * sizeof(uint64_t));
+    // if (fread(offtargets, sizeof(uint64_t), offtargetsCount, fp) == 0) {
+    //     fprintf(stderr, "Error reading index: loading off-target sequences failed\n");
+    //     return 1;
+    // }
+
+    {
+        size_t cuda_mem_free, cuda_mem_total;
+        cudaMemGetInfo(&cuda_mem_free, &cuda_mem_total);
+
+        printf("Free VRAM: %zu\n", cuda_mem_free);
+
+        printf("Required VRAM: %zu\n", offtargetsCount);
+
+        bool offtargetsPinned = offtargetsCount > cuda_mem_free;
+        if (offtargetsPinned) {
+            // Not enough VRAM
+            fprintf(stderr, "Not enough VRAM, using CUDA managed memory\n");
+            cudaMallocManaged(&offtargets, offtargetsCount * sizeof(uint64_t));
+            if (fread(offtargets, sizeof(uint64_t), offtargetsCount, fp) == 0) {
+                fprintf(stderr, "Error reading index: loading off-target sequences failed\n");
+                return 1;
+            }
+        } else {
+            // Enough VRAM, use device memory
+            printf("Using VRAM\n");
+            cudaMalloc(&offtargets, offtargetsCount * sizeof(uint64_t));
+
+            vector<uint64_t> offtargetsTemp(offtargetsCount);
+            if (fread(offtargetsTemp.data(), sizeof(uint64_t), offtargetsCount, fp) == 0) {
+                fprintf(stderr, "Error reading index: loading off-target sequences failed\n");
+                return 1;
+            }
+
+            cudaMemcpy(offtargets, offtargetsTemp.data(), offtargetsCount * sizeof(uint64_t), cudaMemcpyHostToDevice);
+        }
     }
 
-    // printf("offtargetsCount: %d\n", offtargetsCount);
-    // printf("offtargets[166503238]: %d\n", offtargets[166503238]);
-    // DEBUG_IS_CUDA_MANAGED(&offtargets[166503238]);
-
-    // offtargetTest<<<1, 1>>>(offtargets);
-    // cudaDeviceSynchronize();
-    // exit(0);
-    
     /** Prevent assessing an off-target site for multiple slices
      *
      *      Create enough 1-bit "seen" flags for the off-targets
@@ -486,13 +510,61 @@ int main(int argc, char **argv)
      */
     // vector<uint64_t> allSignatures(seqCount * sliceCount);
     uint64_t *allSignatures;
-    cudaMallocManaged(&allSignatures, seqCount * sliceCount * sizeof(uint64_t));
-    
-    if (fread(allSignatures, sizeof(uint64_t), seqCount * sliceCount * sizeof(uint64_t), fp) == 0) {
-        fprintf(stderr, "Error reading index: reading slice contents failed\n");
-        return 1;
+    bool signaturesPinned;
+    {
+        size_t cuda_mem_free, cuda_mem_total;
+        cudaMemGetInfo(&cuda_mem_free, &cuda_mem_total);
+
+        printf("Free VRAM: %zu\n", cuda_mem_free);
+
+        size_t allSignaturesSize = seqCount * sliceCount * sizeof(uint64_t);
+        printf("Required VRAM: %zu\n", allSignaturesSize);
+
+        signaturesPinned = allSignaturesSize > cuda_mem_free;
+        if (signaturesPinned) {
+            // Not enough VRAM
+            // TODO: Use pinned memory
+            fprintf(stderr, "Not enough VRAM, using CUDA managed memory\n");
+            cudaMallocManaged(&allSignatures, allSignaturesSize);
+            if (fread(allSignatures, sizeof(uint64_t), allSignaturesSize, fp) ==
+                0) {
+                fprintf(stderr,
+                        "Error reading index: reading slice contents failed\n");
+                return 1;
+            }
+        } else {
+            // Enough VRAM, use device memory
+            printf("Using VRAM\n");
+            cudaMalloc(&allSignatures, allSignaturesSize);
+
+            vector<uint64_t> allSignaturesTemp(seqCount * sliceCount);
+            if (fread(allSignaturesTemp.data(), sizeof(uint64_t),
+                      allSignaturesSize, fp) == 0) {
+                fprintf(stderr,
+                        "Error reading index: reading slice contents failed\n");
+                return 1;
+            }
+            cudaMemcpy(allSignatures, allSignaturesTemp.data(),
+                       allSignaturesSize, cudaMemcpyHostToDevice);
+
+            // const size_t chunk_size = (8*1024*1024) / sizeof(uint64_t);
+            // vector<uint64_t> allSignaturesTemp(chunk_size);
+            // size_t left_to_read = allSignaturesSize-1;
+            // uint64_t *ptr = allSignaturesTemp.data();
+            // while (left_to_read > 0) {
+            //     size_t to_read = min(left_to_read, chunk_size * sizeof(uint64_t));
+            //     printf("Reading %zu\n", to_read);
+            //     if (fread(ptr, sizeof(uint64_t), to_read, fp) == 0) {
+            //         fprintf(stderr, "Error reading index: reading slice contents failed\n"); return 1;
+            //     }
+            //     cudaMemcpy(allSignatures, ptr, to_read,
+            //     cudaMemcpyHostToDevice); left_to_read -= to_read;
+            //     printf("Read %zu/%zu\n", allSignaturesSize - left_to_read,
+            //     allSignaturesSize);
+            // }
+        }
     }
-    
+
     /** End reading the index */
     fclose(fp);
     
@@ -634,7 +706,7 @@ int main(int argc, char **argv)
 
     /** For each candidate guide */
     // TODO: Remove starting offset before finishing
-    for (size_t searchIdx = querySignatures.size() - 256; searchIdx < querySignatures.size(); searchIdx++) {
+    for (size_t searchIdx = querySignatures.size() - 16; searchIdx < querySignatures.size(); searchIdx++) {
 
         auto searchSignature = querySignatures[searchIdx];
 
