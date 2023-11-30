@@ -455,10 +455,10 @@ int main(int argc, char **argv)
 
         printf("Required VRAM: %zu\n", offtargetsCount);
 
-        bool offtargetsPinned = offtargetsCount > cuda_mem_free;
+        bool offtargetsPinned = offtargetsCount > (cuda_mem_free/2);  // Leave space for the signatures
         if (offtargetsPinned) {
             // Not enough VRAM
-            fprintf(stderr, "Not enough VRAM, using CUDA managed memory\n");
+            fprintf(stderr, "Not enough VRAM, using CUDA managed memory for offtargets\n");
             cudaMallocManaged(&offtargets, offtargetsCount * sizeof(uint64_t));
             if (fread(offtargets, sizeof(uint64_t), offtargetsCount, fp) == 0) {
                 fprintf(stderr, "Error reading index: loading off-target sequences failed\n");
@@ -524,7 +524,7 @@ int main(int argc, char **argv)
         if (signaturesPinned) {
             // Not enough VRAM
             // TODO: Use pinned memory
-            fprintf(stderr, "Not enough VRAM, using CUDA managed memory\n");
+            fprintf(stderr, "Not enough VRAM, using CUDA managed memory for signatures\n");
             cudaMallocManaged(&allSignatures, allSignaturesSize);
             if (fread(allSignatures, sizeof(uint64_t), allSignaturesSize, fp) ==
                 0) {
@@ -622,8 +622,13 @@ int main(int argc, char **argv)
     /** Binary encode query sequences */
 #ifndef CPU_ONLY
     printf("Using CUDA\n");
-    int blockSize = 1024; // This is a typical choice. It could be 128, 512, or 1024 depending on the GPU.
-    int gridSize = (seqLength + blockSize - 1) / blockSize; // N is the size of your data
+
+    // Find the best block size
+    int gridSize, blockSize;
+    cudaOccupancyMaxPotentialBlockSize(&gridSize, &blockSize, sequenceToSignatureCUDA, 0, queryCount);
+    printf("queryCount: %zu\n", queryCount);
+    printf("Block size: %d\n", blockSize);
+    printf("Grid size: %d\n", gridSize);
 
     uint8_t *d_queryDataSet;
     uint64_t *d_querySignatures;
@@ -665,9 +670,10 @@ int main(int argc, char **argv)
     int *d_numOffTargetSitesScored;
     cudaMalloc(&d_numOffTargetSitesScored, sizeof(int));
 
+    // Mapped memory for checkNextSlice
     bool *h_checkNextSlice, *d_checkNextSlice;
-    cudaMallocHost(&h_checkNextSlice, sizeof(bool));  // Use pinned memory for faster transfers
-    cudaMalloc(&d_checkNextSlice, sizeof(bool));
+    cudaHostAlloc(&h_checkNextSlice, sizeof(bool), cudaHostAllocMapped);
+    cudaHostGetDevicePointer(&d_checkNextSlice, h_checkNextSlice, 0);
 
     // 256 byte limit on the number of arguments to a kernel, so we use a struct
     struct constScoringArgs scoring_args = {
@@ -689,14 +695,10 @@ int main(int argc, char **argv)
     cudaMalloc(&d_scoring_args, sizeof(struct constScoringArgs));
     cudaMemcpy(d_scoring_args, &scoring_args, sizeof(struct constScoringArgs), cudaMemcpyHostToDevice);
 
-    struct variScoringArgs slice_args = {
-        .sliceOffset = NULL,
-        .signaturesInSlice = 0,
-        .searchSignature = 0,
-        .maximum_sum = 0.0,
-    };
-
+    // Pinned memory for slice args
+    struct variScoringArgs *slice_args;
     struct variScoringArgs* d_slice_args;
+    cudaMallocHost(&slice_args, sizeof(struct variScoringArgs));
     cudaMalloc(&d_slice_args, sizeof(struct variScoringArgs));
 
     unordered_map<uint64_t, unordered_set<uint64_t>> searchResults;
@@ -704,9 +706,12 @@ int main(int argc, char **argv)
 
     // uint64_t * offtargetTogglesTail = offtargetToggles.data() + numOfftargetToggles - 1;
 
+    // TODO: Don't hard-code the block size limit
+    cudaOccupancyMaxPotentialBlockSize(&gridSize, &blockSize, scoringCUDA, 0, allSlicelistSizes[0]);
+
     /** For each candidate guide */
     // TODO: Remove starting offset before finishing
-    for (size_t searchIdx = querySignatures.size() - 16; searchIdx < querySignatures.size(); searchIdx++) {
+    for (size_t searchIdx = querySignatures.size() - 16384; searchIdx < querySignatures.size(); searchIdx++) {
 
         auto searchSignature = querySignatures[searchIdx];
 
@@ -718,7 +723,6 @@ int main(int argc, char **argv)
         double maximum_sum = (10000.0 - threshold*100) / threshold;
 
         *h_checkNextSlice = true;
-        cudaMemcpy(d_checkNextSlice, h_checkNextSlice, sizeof(bool), cudaMemcpyHostToDevice);
 
         /** For each ISSL slice */
         for (size_t i = 0; i < sliceCount; i++) {
@@ -735,7 +739,7 @@ int main(int argc, char **argv)
 
             /** For each off-target signature in slice */
 
-            slice_args = {
+            *slice_args = {
                 .sliceOffset = sliceOffset,
                 .signaturesInSlice = signaturesInSlice,
                 .searchSignature = searchSignature,
@@ -744,11 +748,10 @@ int main(int argc, char **argv)
 
             // Check last run to see if we should continue
             cudaDeviceSynchronize();
-            cudaMemcpy(h_checkNextSlice, d_checkNextSlice, sizeof(bool), cudaMemcpyDeviceToHost);
             if (!*h_checkNextSlice)
                 break;
 
-            cudaMemcpy(d_slice_args, &slice_args, sizeof(struct variScoringArgs), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_slice_args, slice_args, sizeof(struct variScoringArgs), cudaMemcpyHostToDevice);
 
             scoringCUDA<<<blockSize, gridSize>>>(d_scoring_args, d_slice_args);
             // Continue next iteration to prepare the next run
@@ -777,7 +780,8 @@ int main(int argc, char **argv)
     cudaFree(d_totScoreCfd);
     cudaFree(d_numOffTargetSitesScored);
     cudaFree(d_scoring_args);
-    cudaFree(d_checkNextSlice);
+    cudaFreeHost(slice_args);
+    cudaFree(d_slice_args);
     cudaFreeHost(h_checkNextSlice);
 
 #else
