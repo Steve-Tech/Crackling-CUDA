@@ -141,27 +141,38 @@ struct variScoringArgs {
             double maximum_sum;
 };
 
-__global__ void scoringCUDA(struct constScoringArgs* c_args, struct variScoringArgs* v_args) {
-    uint64_t *offtargets = c_args->offtargets;
-    uint64_t *offtargetTogglesTail = c_args->offtargetTogglesTail;
-    int &maxDist = c_args->maxDist;
-    CalcMethod &calcMethod = c_args->calcMethod;
-    ScoreMethod &scoreMethod = c_args->scoreMethod;
-    // double *precalculatedScores = c_args->precalculatedScores;
-    double *cfdPamPenalties = c_args->cfdPamPenalties;
-    double *cfdPosPenalties = c_args->cfdPosPenalties;
-    double &totScoreMit = *c_args->totScoreMit;
-    double &totScoreCfd = *c_args->totScoreCfd;
-    int &numOffTargetSitesScored = *c_args->numOffTargetSitesScored;
-    bool &checkNextSlice = *c_args->checkNextSlice;
+// This should be faster to read than checkNextSlice
+__device__ bool continueCUDA = true;
 
+// Makes use of constant memory
+__constant__ struct constScoringArgs d_constant_args;
+
+__global__ void scoringCUDA(struct variScoringArgs* v_args) {
+    // Extract constScoringArgs into easier to use variables
+    uint64_t *offtargets = d_constant_args.offtargets;
+    uint64_t *offtargetTogglesTail = d_constant_args.offtargetTogglesTail;
+    const int maxDist = d_constant_args.maxDist;
+    const CalcMethod calcMethod = d_constant_args.calcMethod;
+    const ScoreMethod scoreMethod = d_constant_args.scoreMethod;
+    // double *precalculatedScores = d_constant_args.precalculatedScores;
+    double *cfdPamPenalties = d_constant_args.cfdPamPenalties;
+    double *cfdPosPenalties = d_constant_args.cfdPosPenalties;
+    double &totScoreMit = *d_constant_args.totScoreMit;
+    double &totScoreCfd = *d_constant_args.totScoreCfd;
+    int &numOffTargetSitesScored = *d_constant_args.numOffTargetSitesScored;
+    bool &checkNextSlice = *d_constant_args.checkNextSlice;
+
+    // Extract variScoringArgs into easier to use variables
+    // References seemed slow, but only here, not above
     uint64_t *sliceOffset = v_args->sliceOffset;
-    uint64_t &signaturesInSlice = v_args->signaturesInSlice;
-    uint64_t searchSignature = v_args->searchSignature;
-    double &maximum_sum = v_args->maximum_sum;
+    const uint64_t signaturesInSlice = v_args->signaturesInSlice;
+    const uint64_t searchSignature = v_args->searchSignature;
+    const double maximum_sum = v_args->maximum_sum;
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
+
+    continueCUDA = true;
 
     for (size_t j = index; j < signaturesInSlice; j += stride) {
         uint64_t signatureWithOccurrencesAndId = sliceOffset[j];
@@ -203,9 +214,8 @@ __global__ void scoringCUDA(struct constScoringArgs* c_args, struct variScoringA
         
         if (dist >= 0 && dist <= maxDist) {
             /** Prevent assessing the same off-target for multiple slices */
-            uint64_t seenOfftargetAlready = 0;
             uint64_t * ptrOfftargetFlag = (offtargetTogglesTail - (signatureId / 64));
-            seenOfftargetAlready = (*ptrOfftargetFlag >> (signatureId % 64)) & 1ULL;
+            uint64_t seenOfftargetAlready = (*ptrOfftargetFlag >> (signatureId % 64)) & 1ULL;
 
 
             if (!seenOfftargetAlready) {
@@ -284,6 +294,7 @@ __global__ void scoringCUDA(struct constScoringArgs* c_args, struct variScoringA
                 {
                     // atomicOr doesn't support 64-bit, so we split it into two 32-bit halves
                     // I don't know how expensive atomicOr is, so I've 'optimised' the second one out
+                    // This seems ever so slighly faster when testing
                     uint32_t bit = signatureId % 64;
                     uint32_t is_high = bit > 31;
                     uint32_t flag32 = 1ULL << (bit - (is_high * 32));
@@ -297,35 +308,41 @@ __global__ void scoringCUDA(struct constScoringArgs* c_args, struct variScoringA
                 case ScoreMethod::mitAndCfd:
                     if (totScoreMit > maximum_sum &&
                         totScoreCfd > maximum_sum) {
+                        continueCUDA = false;
                         checkNextSlice = false;
                     }
                     break;
                 case ScoreMethod::mitOrCfd:
                     if (totScoreMit > maximum_sum ||
                         totScoreCfd > maximum_sum) {
+                        continueCUDA = false;
                         checkNextSlice = false;
                     }
                     break;
                 case ScoreMethod::avgMitCfd:
                     if (((totScoreMit + totScoreCfd) / 2.0) > maximum_sum) {
+                        continueCUDA = false;
                         checkNextSlice = false;
                     }
                     break;
                 case ScoreMethod::mit:
                     if (totScoreMit > maximum_sum) {
+                        continueCUDA = false;
                         checkNextSlice = false;
                     }
                     break;
                 case ScoreMethod::cfd:
                     if (totScoreCfd > maximum_sum) {
+                        continueCUDA = false;
                         checkNextSlice = false;
                     }
                     break;
                 default:
                     break;
                 }
-                if (!checkNextSlice) {
-                    break;
+
+                if (!continueCUDA) {
+                    return;
                 }
             }
         }
@@ -586,12 +603,15 @@ int main(int argc, char **argv)
      */
     vector<vector<uint64_t *>> sliceLists(sliceCount, vector<uint64_t *>(sliceLimit));
 
+    uint64_t maxSliceSize = 0;
+
     uint64_t *offset = allSignatures;
     for (size_t i = 0; i < sliceCount; i++) {
         for (size_t j = 0; j < sliceLimit; j++) {
             size_t idx = i * sliceLimit + j;
             sliceLists[i][j] = offset;
             offset += allSlicelistSizes[idx];
+            maxSliceSize = max(maxSliceSize, allSlicelistSizes[idx]);
         }
     }
     
@@ -676,7 +696,7 @@ int main(int argc, char **argv)
     cudaHostGetDevicePointer(&d_checkNextSlice, h_checkNextSlice, 0);
 
     // 256 byte limit on the number of arguments to a kernel, so we use a struct
-    struct constScoringArgs scoring_args = {
+    struct constScoringArgs constant_args = {
         .offtargets = offtargets,
         .offtargetTogglesTail = d_offtargetTogglesTail,
         .maxDist = maxDist,
@@ -691,9 +711,7 @@ int main(int argc, char **argv)
         .checkNextSlice = d_checkNextSlice,
     };
 
-    struct constScoringArgs* d_scoring_args;
-    cudaMalloc(&d_scoring_args, sizeof(struct constScoringArgs));
-    cudaMemcpy(d_scoring_args, &scoring_args, sizeof(struct constScoringArgs), cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(d_constant_args, &constant_args, sizeof(struct constScoringArgs));
 
     // Pinned memory for slice args
     struct variScoringArgs *slice_args;
@@ -706,12 +724,15 @@ int main(int argc, char **argv)
 
     // uint64_t * offtargetTogglesTail = offtargetToggles.data() + numOfftargetToggles - 1;
 
-    // TODO: Don't hard-code the block size limit
-    cudaOccupancyMaxPotentialBlockSize(&gridSize, &blockSize, scoringCUDA, 0, allSlicelistSizes[0]);
+    cudaOccupancyMaxPotentialBlockSize(&gridSize, &blockSize, scoringCUDA, 0, maxSliceSize);
+    printf("Block size: %d\n", blockSize);
+    printf("Grid size: %d\n", gridSize);
+
+    int skipped = 0;
 
     /** For each candidate guide */
     // TODO: Remove starting offset before finishing
-    for (size_t searchIdx = querySignatures.size() - 16384; searchIdx < querySignatures.size(); searchIdx++) {
+    for (size_t searchIdx = querySignatures.size() - 32768; searchIdx < querySignatures.size(); searchIdx++) {
 
         auto searchSignature = querySignatures[searchIdx];
 
@@ -748,12 +769,14 @@ int main(int argc, char **argv)
 
             // Check last run to see if we should continue
             cudaDeviceSynchronize();
-            if (!*h_checkNextSlice)
+            if (!*h_checkNextSlice) {
+                skipped++;
                 break;
+            }
 
             cudaMemcpy(d_slice_args, slice_args, sizeof(struct variScoringArgs), cudaMemcpyHostToDevice);
 
-            scoringCUDA<<<blockSize, gridSize>>>(d_scoring_args, d_slice_args);
+            scoringCUDA<<<blockSize, gridSize>>>(d_slice_args);
             // Continue next iteration to prepare the next run
         }
         cudaDeviceSynchronize();
@@ -772,6 +795,8 @@ int main(int argc, char **argv)
         // printf("Processed %zu/%zu\n", searchIdx, querySignatures.size());
     }
 
+    printf("Skipped %d\n", skipped);
+
     // Free VRAM
     cudaFree(d_cfdPamPenalties);
     cudaFree(d_cfdPosPenalties);
@@ -779,10 +804,11 @@ int main(int argc, char **argv)
     cudaFree(d_totScoreMit);
     cudaFree(d_totScoreCfd);
     cudaFree(d_numOffTargetSitesScored);
-    cudaFree(d_scoring_args);
     cudaFreeHost(slice_args);
     cudaFree(d_slice_args);
     cudaFreeHost(h_checkNextSlice);
+
+    cudaDeviceReset();
 
 #else
     #pragma omp parallel
