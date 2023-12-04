@@ -154,7 +154,7 @@ __global__ void scoringCUDA(struct variScoringArgs* v_args) {
     const int maxDist = d_constant_args.maxDist;
     const CalcMethod calcMethod = d_constant_args.calcMethod;
     const ScoreMethod scoreMethod = d_constant_args.scoreMethod;
-    // double *precalculatedScores = d_constant_args.precalculatedScores;
+    double *precalculatedScores = d_constant_args.precalculatedScores;
     double *cfdPamPenalties = d_constant_args.cfdPamPenalties;
     double *cfdPosPenalties = d_constant_args.cfdPosPenalties;
     double &totScoreMit = *d_constant_args.totScoreMit;
@@ -169,12 +169,12 @@ __global__ void scoringCUDA(struct variScoringArgs* v_args) {
     const uint64_t searchSignature = v_args->searchSignature;
     const double maximum_sum = v_args->maximum_sum;
 
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
+    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int stride = blockDim.x * gridDim.x;
 
     continueCUDA = true;
 
-    for (size_t j = index; j < signaturesInSlice; j += stride) {
+    for (uint64_t j = index; j < signaturesInSlice; j += stride) {
         uint64_t signatureWithOccurrencesAndId = sliceOffset[j];
         uint64_t signatureId = signatureWithOccurrencesAndId & 0xFFFFFFFFull;
         uint32_t occurrences = (signatureWithOccurrencesAndId >> (32));
@@ -223,6 +223,18 @@ __global__ void scoringCUDA(struct variScoringArgs* v_args) {
                 if (calcMethod.mit) {
                     if (dist > 0) {
                         // totScoreMit += precalculatedScores[mismatches] * (double)occurrences;
+
+                        uint64_t mask_40bit = mismatches;
+                        uint32_t mask_20bit = 0;
+                        uint32_t shift = 0;
+
+                        for (uint32_t bit = 0; bit < 20; bit++) {
+                            mask_20bit |= (mask_40bit & 1) << shift;
+                            mask_40bit >>= 2;
+                            shift += 1;
+                        }
+
+                        atomicAdd(&totScoreMit, precalculatedScores[mask_20bit] * (double)occurrences);
                     }
                 } 
                 
@@ -241,8 +253,8 @@ __global__ void scoringCUDA(struct variScoringArgs* v_args) {
                     else if (dist > 0 && dist <= maxDist) {
                         cfdScore = cfdPamPenalties[0b1010]; // PAM: NGG, TODO: do not hard-code the PAM
                         
-                        for (size_t pos = 0; pos < 20; pos++) {
-                            size_t mask = pos << 4;
+                        for (uint32_t pos = 0; pos < 20; pos++) {
+                            uint32_t mask = pos << 4;
                             
                             /** Create the mask to look up the position-identity score
                              *      In Python... c2b is char to bit
@@ -445,16 +457,36 @@ int main(int argc, char **argv)
      *  
      *      - `score` is the local MIT score for this mismatch combination
      */
-    phmap::flat_hash_map<uint64_t, double> precalculatedScores;
+    // phmap::flat_hash_map<uint64_t, double> precalculatedScores;
+    const size_t precalculatedScoresSize = (1 << 20) - 1; // 20 bit mask
+    vector<double> precalculatedScores(precalculatedScoresSize, -1.0);
+
+    double* d_precalculatedScores;
+    // This should take 8MB of VRAM, I don't think we will need to check free VRAM for this
+    cudaMalloc(&d_precalculatedScores, precalculatedScoresSize * sizeof(double));
 
     for (int i = 0; i < scoresCount; i++) {
         uint64_t mask = 0;
         double score = 0.0;
         fread(&mask, sizeof(uint64_t), 1, fp);
         fread(&score, sizeof(double), 1, fp);
+
+        // Compress the 40-bit mask into a 20-bit mask for space efficiency
+        uint64_t mask_40bit = mask;
+        uint_fast32_t mask_20bit = 0;
+        size_t shift = 0;
+
+        for (size_t bit = 0; bit < 20; bit++) {
+            mask_20bit |= (mask_40bit & 1) << shift;
+            mask_40bit >>= 2;
+            shift += 1;
+        }
         
-        precalculatedScores.insert(pair<uint64_t, double>(mask, score));
+        // precalculatedScores.insert(pair<uint64_t, double>(mask, score));
+        precalculatedScores[mask_20bit] = score;
     }
+
+    cudaMemcpy(d_precalculatedScores, precalculatedScores.data(), precalculatedScoresSize * sizeof(double), cudaMemcpyHostToDevice);
     
     /** Load in all of the off-target sites */
     uint64_t* offtargets;
@@ -643,6 +675,9 @@ int main(int argc, char **argv)
 #ifndef CPU_ONLY
     printf("Using CUDA\n");
 
+    // Increase L1 cache size at the expense of shared memory (which we don't use)
+    cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
+
     // Find the best block size
     int gridSize, blockSize;
     cudaOccupancyMaxPotentialBlockSize(&gridSize, &blockSize, sequenceToSignatureCUDA, 0, queryCount);
@@ -702,7 +737,7 @@ int main(int argc, char **argv)
         .maxDist = maxDist,
         .calcMethod = calcMethod,
         .scoreMethod = scoreMethod,
-        .precalculatedScores = NULL,  // TODO: precalculatedScores
+        .precalculatedScores = d_precalculatedScores,
         .cfdPamPenalties = d_cfdPamPenalties,
         .cfdPosPenalties = d_cfdPosPenalties,
         .totScoreMit = d_totScoreMit,
