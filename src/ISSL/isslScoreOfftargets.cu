@@ -766,8 +766,7 @@ int main(int argc, char **argv)
     int skipped = 0;
 
     /** For each candidate guide */
-    // TODO: Remove starting offset before finishing
-    for (size_t searchIdx = querySignatures.size() - 32768; searchIdx < querySignatures.size(); searchIdx++) {
+    for (size_t searchIdx = 0; searchIdx < querySignatures.size(); searchIdx++) {
 
         auto searchSignature = querySignatures[searchIdx];
 
@@ -1064,8 +1063,7 @@ int main(int argc, char **argv)
     }
 #endif
     /** Print global scores to stdout */
-    // TODO: Remove starting offset before finishing
-    for (size_t searchIdx = querySignatures.size() - 128; searchIdx < querySignatures.size(); searchIdx++) {
+    for (size_t searchIdx = 0; searchIdx < querySignatures.size(); searchIdx++) {
         auto querySequence = signatureToSequence(querySignatures[searchIdx]);
         printf("%s\t", querySequence.c_str());
         if (calcMethod.mit) 
