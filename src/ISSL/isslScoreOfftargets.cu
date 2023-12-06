@@ -4,10 +4,16 @@ Faster and better CRISPR guide RNA design with the Crackling method.
 Jacob Bradford, Timothy Chappell, Dimitri Perrin
 bioRxiv 2020.02.14.950261; doi: https://doi.org/10.1101/2020.02.14.950261
 
+A CUDA 6.0+ compatible GPU is required for this CUDA version of Crackling (Pascal/GTX 10xx or newer).
+Enough VRAM is basically essential (but it will run very slowly with less).
 
 To compile:
 
-nvcc -o isslScoreOfftargets isslScoreOfftargets.cu -Iinclude/ -O3 -std=c++11 -Xcompiler -fopenmp -Xcompiler -mpopcnt -Xcompiler -Iparallel_hashmap
+nvcc -o isslScoreOfftargets isslScoreOfftargets.cu -O3 -Iinclude/ -arch=sm_60
+
+Consider using native compilation for the best performance on your system:
+  * Set `-arch=native` for native GPU compilation
+  * Add `-Xcompiler -march=native` for native CPU compilation (has minimal effect)
 
 */
 
@@ -23,17 +29,9 @@ nvcc -o isslScoreOfftargets isslScoreOfftargets.cu -Iinclude/ -O3 -std=c++11 -Xc
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <stdint.h>
-#include <sys/time.h>
-#include <chrono>
 #include <bitset>
 #include <iostream>
-#include <climits>
-#include <stdio.h>
-#include <cstring>
-#include <omp.h>
-#include <phmap.h>
-#include <map>
+// #include <omp.h>
 
 using namespace std;
 
@@ -122,7 +120,7 @@ void sequenceToSignatureCUDA(size_t queryCount, size_t seqLength, uint8_t *query
 struct constScoringArgs {
             uint64_t *offtargets;
             uint64_t *offtargetTogglesTail;
-            int maxDist;
+            uint32_t maxDist;
             CalcMethod calcMethod;
             ScoreMethod scoreMethod;
             double *precalculatedScores;
@@ -130,7 +128,7 @@ struct constScoringArgs {
             double *cfdPosPenalties;
             double *totScoreMit;
             double *totScoreCfd;
-            int *numOffTargetSitesScored;
+            uint32_t *numOffTargetSitesScored;
             bool *checkNextSlice;
 };
 
@@ -141,7 +139,7 @@ struct variScoringArgs {
             double maximum_sum;
 };
 
-// This should be faster to read than checkNextSlice
+// This should be faster to read on the GPU than checkNextSlice (which is on the CPU)
 __device__ bool continueCUDA = true;
 
 // Makes use of constant memory
@@ -151,7 +149,7 @@ __global__ void scoringCUDA(struct variScoringArgs* v_args) {
     // Extract constScoringArgs into easier to use variables
     uint64_t *offtargets = d_constant_args.offtargets;
     uint64_t *offtargetTogglesTail = d_constant_args.offtargetTogglesTail;
-    const int maxDist = d_constant_args.maxDist;
+    const uint32_t maxDist = d_constant_args.maxDist;
     const CalcMethod calcMethod = d_constant_args.calcMethod;
     const ScoreMethod scoreMethod = d_constant_args.scoreMethod;
     double *precalculatedScores = d_constant_args.precalculatedScores;
@@ -159,7 +157,7 @@ __global__ void scoringCUDA(struct variScoringArgs* v_args) {
     double *cfdPosPenalties = d_constant_args.cfdPosPenalties;
     double &totScoreMit = *d_constant_args.totScoreMit;
     double &totScoreCfd = *d_constant_args.totScoreCfd;
-    int &numOffTargetSitesScored = *d_constant_args.numOffTargetSitesScored;
+    uint32_t &numOffTargetSitesScored = *d_constant_args.numOffTargetSitesScored;
     bool &checkNextSlice = *d_constant_args.checkNextSlice;
 
     // Extract variScoringArgs into easier to use variables
@@ -169,8 +167,8 @@ __global__ void scoringCUDA(struct variScoringArgs* v_args) {
     const uint64_t searchSignature = v_args->searchSignature;
     const double maximum_sum = v_args->maximum_sum;
 
-    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int stride = blockDim.x * gridDim.x;
+    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t stride = blockDim.x * gridDim.x;
 
     continueCUDA = true;
 
@@ -210,9 +208,9 @@ __global__ void scoringCUDA(struct variScoringArgs* v_args) {
         uint64_t evenBits = xoredSignatures & 0xAAAAAAAAAAAAAAAAull;
         uint64_t oddBits = xoredSignatures & 0x5555555555555555ull;
         uint64_t mismatches = (evenBits >> 1) | oddBits;
-        int dist = __popcll(mismatches);
+        uint32_t dist = __popcll(mismatches);
         
-        if (dist >= 0 && dist <= maxDist) {
+        if (dist <= maxDist) {
             /** Prevent assessing the same off-target for multiple slices */
             uint64_t * ptrOfftargetFlag = (offtargetTogglesTail - (signatureId / 64));
             uint64_t seenOfftargetAlready = (*ptrOfftargetFlag >> (signatureId % 64)) & 1ULL;
@@ -379,7 +377,7 @@ int main(int argc, char **argv)
     signatureIndex[3] = 'T';
 
     /** The maximum number of mismatches */
-    int maxDist = atoi(argv[3]);
+    unsigned int maxDist = atoi(argv[3]);
     
     /** The threshold used to exit scoring early */
     double threshold = atof(argv[4]);
@@ -500,14 +498,10 @@ int main(int argc, char **argv)
         size_t cuda_mem_free, cuda_mem_total;
         cudaMemGetInfo(&cuda_mem_free, &cuda_mem_total);
 
-        printf("Free VRAM: %zu\n", cuda_mem_free);
-
-        printf("Required VRAM: %zu\n", offtargetsCount);
-
-        bool offtargetsPinned = offtargetsCount > (cuda_mem_free/2);  // Leave space for the signatures
-        if (offtargetsPinned) {
+        if (offtargetsCount > (cuda_mem_free/2)) {  // (/2) Leave space for the signatures
             // Not enough VRAM
             fprintf(stderr, "Not enough VRAM, using CUDA managed memory for offtargets\n");
+            fprintf(stderr, "%zuMB Required\n", offtargetsCount * sizeof(uint64_t) / (1024*1024));
             cudaMallocManaged(&offtargets, offtargetsCount * sizeof(uint64_t));
             if (fread(offtargets, sizeof(uint64_t), offtargetsCount, fp) == 0) {
                 fprintf(stderr, "Error reading index: loading off-target sequences failed\n");
@@ -515,7 +509,6 @@ int main(int argc, char **argv)
             }
         } else {
             // Enough VRAM, use device memory
-            printf("Using VRAM\n");
             cudaMalloc(&offtargets, offtargetsCount * sizeof(uint64_t));
 
             vector<uint64_t> offtargetsTemp(offtargetsCount);
@@ -559,43 +552,35 @@ int main(int argc, char **argv)
      */
     // vector<uint64_t> allSignatures(seqCount * sliceCount);
     uint64_t *allSignatures;
-    bool signaturesPinned;
     {
         size_t cuda_mem_free, cuda_mem_total;
         cudaMemGetInfo(&cuda_mem_free, &cuda_mem_total);
 
-        printf("Free VRAM: %zu\n", cuda_mem_free);
-
         size_t allSignaturesSize = seqCount * sliceCount * sizeof(uint64_t);
-        printf("Required VRAM: %zu\n", allSignaturesSize);
-
-        signaturesPinned = allSignaturesSize > cuda_mem_free;
-        if (signaturesPinned) {
+        if (allSignaturesSize > cuda_mem_free) {
             // Not enough VRAM
-            // TODO: Use pinned memory
             fprintf(stderr, "Not enough VRAM, using CUDA managed memory for signatures\n");
+            fprintf(stderr, "%zuMB Required\n", allSignaturesSize / (1024*1024));
+
             cudaMallocManaged(&allSignatures, allSignaturesSize);
-            if (fread(allSignatures, sizeof(uint64_t), allSignaturesSize, fp) ==
-                0) {
-                fprintf(stderr,
-                        "Error reading index: reading slice contents failed\n");
+            if (fread(allSignatures, sizeof(uint64_t), allSignaturesSize, fp) == 0) {
+                fprintf(stderr, "Error reading index: reading slice contents failed\n");
                 return 1;
             }
         } else {
             // Enough VRAM, use device memory
-            printf("Using VRAM\n");
             cudaMalloc(&allSignatures, allSignaturesSize);
 
             vector<uint64_t> allSignaturesTemp(seqCount * sliceCount);
             if (fread(allSignaturesTemp.data(), sizeof(uint64_t),
                       allSignaturesSize, fp) == 0) {
-                fprintf(stderr,
-                        "Error reading index: reading slice contents failed\n");
+                fprintf(stderr, "Error reading index: reading slice contents failed\n");
                 return 1;
             }
             cudaMemcpy(allSignatures, allSignaturesTemp.data(),
                        allSignaturesSize, cudaMemcpyHostToDevice);
 
+            // TODO: Read in chunks
             // const size_t chunk_size = (8*1024*1024) / sizeof(uint64_t);
             // vector<uint64_t> allSignaturesTemp(chunk_size);
             // size_t left_to_read = allSignaturesSize-1;
@@ -672,8 +657,6 @@ int main(int argc, char **argv)
     fclose(fp);
 
     /** Binary encode query sequences */
-#ifndef CPU_ONLY
-    printf("Using CUDA\n");
 
     // Increase L1 cache size at the expense of shared memory (which we don't use)
     cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
@@ -681,30 +664,28 @@ int main(int argc, char **argv)
     // Find the best block size
     int gridSize, blockSize;
     cudaOccupancyMaxPotentialBlockSize(&gridSize, &blockSize, sequenceToSignatureCUDA, 0, queryCount);
-    printf("queryCount: %zu\n", queryCount);
-    printf("Block size: %d\n", blockSize);
-    printf("Grid size: %d\n", gridSize);
-
-    uint8_t *d_queryDataSet;
-    uint64_t *d_querySignatures;
 
     // Allocate VRAM for the query data
+    uint8_t *d_queryDataSet;
+    uint64_t *d_querySignatures;
     cudaMalloc(&d_queryDataSet, queryCount * (seqLength + 1) * sizeof(uint8_t));
     cudaMalloc(&d_querySignatures, queryCount * sizeof(uint64_t));
 
     // Copy the query data to the VRAM
     cudaMemcpy(d_queryDataSet, &queryDataSet[0], queryCount * (seqLength + 1) * sizeof(uint8_t), cudaMemcpyHostToDevice);
-    // cudaMemcpy(d_querySignatures, &querySignatures[0], queryCount * sizeof(uint64_t), cudaMemcpyHostToDevice);
 
     // Calculate the signatures
     sequenceToSignatureCUDA<<<blockSize, gridSize>>>(queryCount, seqLength, d_queryDataSet, d_querySignatures);
-    cudaDeviceSynchronize();
-    cudaFree(d_queryDataSet);
 
+    // Wait for CUDA to finish
+    cudaDeviceSynchronize();
+
+    // Free VRAM and copy the signatures back to system RAM
+    cudaFree(d_queryDataSet);
     cudaMemcpy(&querySignatures[0], d_querySignatures, queryCount * sizeof(uint64_t), cudaMemcpyDeviceToHost);
     cudaFree(d_querySignatures);
 
-
+    // Allocate VRAM for various variables
     double *d_cfdPamPenalties;
     double *d_cfdPosPenalties;
     cudaMalloc(&d_cfdPamPenalties, sizeof(cfdPamPenalties));
@@ -722,7 +703,7 @@ int main(int argc, char **argv)
     cudaMalloc(&d_totScoreMit, sizeof(double));
     cudaMalloc(&d_totScoreCfd, sizeof(double));
 
-    int *d_numOffTargetSitesScored;
+    uint32_t *d_numOffTargetSitesScored;
     cudaMalloc(&d_numOffTargetSitesScored, sizeof(int));
 
     // Mapped memory for checkNextSlice
@@ -730,8 +711,9 @@ int main(int argc, char **argv)
     cudaHostAlloc(&h_checkNextSlice, sizeof(bool), cudaHostAllocMapped);
     cudaHostGetDevicePointer(&d_checkNextSlice, h_checkNextSlice, 0);
 
-    // 256 byte limit on the number of arguments to a kernel, so we use a struct
-    struct constScoringArgs constant_args = {
+    // 256 byte limit on the number of arguments to a kernel, so we use structs
+    // This one stays in constant memory however
+    const struct constScoringArgs constant_args = {
         .offtargets = offtargets,
         .offtargetTogglesTail = d_offtargetTogglesTail,
         .maxDist = maxDist,
@@ -745,24 +727,21 @@ int main(int argc, char **argv)
         .numOffTargetSitesScored = d_numOffTargetSitesScored,
         .checkNextSlice = d_checkNextSlice,
     };
-
+    // Copy to constant memory
     cudaMemcpyToSymbol(d_constant_args, &constant_args, sizeof(struct constScoringArgs));
 
     // Pinned memory for slice args
     struct variScoringArgs *slice_args;
-    struct variScoringArgs* d_slice_args;
+    struct variScoringArgs *d_slice_args;
     cudaMallocHost(&slice_args, sizeof(struct variScoringArgs));
     cudaMalloc(&d_slice_args, sizeof(struct variScoringArgs));
 
     unordered_map<uint64_t, unordered_set<uint64_t>> searchResults;
-    // vector<uint64_t> offtargetToggles(numOfftargetToggles);
 
-    // uint64_t * offtargetTogglesTail = offtargetToggles.data() + numOfftargetToggles - 1;
-
+    // Recalculate the block size for the scoring kernel
     cudaOccupancyMaxPotentialBlockSize(&gridSize, &blockSize, scoringCUDA, 0, maxSliceSize);
-    printf("Block size: %d\n", blockSize);
-    printf("Grid size: %d\n", gridSize);
 
+    // TODO: Remove once figured out
     int skipped = 0;
 
     /** For each candidate guide */
@@ -771,10 +750,10 @@ int main(int argc, char **argv)
         auto searchSignature = querySignatures[searchIdx];
 
         /** Global scores */
-        cudaMemset(d_totScoreMit, 0, sizeof(double));  // double totScoreMit = 0.0;
-        cudaMemset(d_totScoreCfd, 0, sizeof(double));  // double totScoreCfd = 0.0;
+        cudaMemset(d_totScoreMit, 0, sizeof(double));  // totScoreMit = 0.0;
+        cudaMemset(d_totScoreCfd, 0, sizeof(double));  // totScoreCfd = 0.0;
         
-        cudaMemset(d_numOffTargetSitesScored, 0, sizeof(int));  // int numOffTargetSitesScored = 0;
+        cudaMemset(d_numOffTargetSitesScored, 0, sizeof(int));  // numOffTargetSitesScored = 0;
         double maximum_sum = (10000.0 - threshold*100) / threshold;
 
         *h_checkNextSlice = true;
@@ -782,7 +761,7 @@ int main(int argc, char **argv)
         /** For each ISSL slice */
         for (size_t i = 0; i < sliceCount; i++) {
             uint64_t sliceMask = sliceLimit - 1;
-            int sliceShift = sliceWidth * i;
+            size_t sliceShift = sliceWidth * i;
             sliceMask = sliceMask << sliceShift;
             
             uint64_t searchSlice = (searchSignature & sliceMask) >> sliceShift;
@@ -825,8 +804,6 @@ int main(int argc, char **argv)
 
         // memset(offtargetToggles.data(), 0, sizeof(uint64_t)*offtargetToggles.size());
         cudaMemset(d_offtargetToggles, 0, numOfftargetToggles * sizeof(uint64_t));
-
-        // printf("Processed %zu/%zu\n", searchIdx, querySignatures.size());
     }
 
     printf("Skipped %d\n", skipped);
@@ -844,224 +821,6 @@ int main(int argc, char **argv)
 
     cudaDeviceReset();
 
-#else
-    #pragma omp parallel
-    {
-        #pragma omp for
-        for (size_t i = 0; i < queryCount; i++) {
-            char *ptr = &queryDataSet[i * seqLineLength];
-            uint64_t signature = sequenceToSignature(ptr);
-            querySignatures[i] = signature;
-        }
-    }
-
-    /** Begin scoring */
-    #pragma omp parallel
-    {
-        unordered_map<uint64_t, unordered_set<uint64_t>> searchResults;
-        vector<uint64_t> offtargetToggles(numOfftargetToggles);
-    
-        uint64_t * offtargetTogglesTail = offtargetToggles.data() + numOfftargetToggles - 1;
-
-        /** For each candidate guide */
-        #pragma omp for
-        // TODO: Remove starting offset before finishing
-        for (size_t searchIdx = querySignatures.size() - 32; searchIdx < querySignatures.size(); searchIdx++) {
-
-            auto searchSignature = querySignatures[searchIdx];
-
-            /** Global scores */
-            double totScoreMit = 0.0;
-            double totScoreCfd = 0.0;
-            
-            int numOffTargetSitesScored = 0;
-            double maximum_sum = (10000.0 - threshold*100) / threshold;
-            bool checkNextSlice = true;
-            
-            /** For each ISSL slice */
-            for (size_t i = 0; i < sliceCount; i++) {
-                uint64_t sliceMask = sliceLimit - 1;
-                int sliceShift = sliceWidth * i;
-                sliceMask = sliceMask << sliceShift;
-                auto &sliceList = sliceLists[i];
-                
-                uint64_t searchSlice = (searchSignature & sliceMask) >> sliceShift;
-                
-                size_t idx = i * sliceLimit + searchSlice;
-                
-                size_t signaturesInSlice = allSlicelistSizes[idx];
-                uint64_t *sliceOffset = sliceList[searchSlice];
-                
-                /** For each off-target signature in slice */
-                for (size_t j = 0; j < signaturesInSlice; j++) {
-                    
-                    auto signatureWithOccurrencesAndId = sliceOffset[j];
-                    auto signatureId = signatureWithOccurrencesAndId & 0xFFFFFFFFull;
-                    uint32_t occurrences = (signatureWithOccurrencesAndId >> (32));
-
-                    /** Find the positions of mismatches 
-                     *
-                     *  Search signature (SS):    A  A  T  T    G  C  A  T
-                     *                           00 00 11 11   10 01 00 11
-                     *              
-                     *        Off-target (OT):    A  T  A  T    C  G  A  T
-                     *                           00 11 00 11   01 10 00 11
-                     *                           
-                     *                SS ^ OT:   00 00 11 11   10 01 00 11
-                     *                         ^ 00 11 00 11   01 10 00 11
-                     *                  (XORd) = 00 11 11 00   11 11 00 00
-                     *
-                     *        XORd & evenBits:   00 11 11 00   11 11 00 00
-                     *                         & 10 10 10 10   10 10 10 10
-                     *                   (eX)  = 00 10 10 00   10 10 00 00
-                     *
-                     *         XORd & oddBits:   00 11 11 00   11 11 00 00
-                     *                         & 01 01 01 01   01 01 01 01
-                     *                   (oX)  = 00 01 01 00   01 01 00 00
-                     *
-                     *         (eX >> 1) | oX:   00 01 01 00   01 01 00 00 (>>1)
-                     *                         | 00 01 01 00   01 01 00 00
-                     *            mismatches   = 00 01 01 00   01 01 00 00
-                     *
-                     *   popcount(mismatches):   4
-                     */
-                    uint64_t xoredSignatures = searchSignature ^ offtargets[signatureId];
-                    uint64_t evenBits = xoredSignatures & 0xAAAAAAAAAAAAAAAAull;
-                    uint64_t oddBits = xoredSignatures & 0x5555555555555555ull;
-                    uint64_t mismatches = (evenBits >> 1) | oddBits;
-                    int dist = __builtin_popcountll(mismatches);
-					
-					if (dist >= 0 && dist <= maxDist) {
-
-						/** Prevent assessing the same off-target for multiple slices */
-						uint64_t seenOfftargetAlready = 0;
-						uint64_t * ptrOfftargetFlag = (offtargetTogglesTail - (signatureId / 64));
-						seenOfftargetAlready = (*ptrOfftargetFlag >> (signatureId % 64)) & 1ULL;
-                    
-										
-						if (!seenOfftargetAlready) {
-							// Begin calculating MIT score
-							if (calcMethod.mit) {
-								if (dist > 0) {
-									// totScoreMit += precalculatedScores[mismatches] * (double)occurrences;
-								}
-							} 
-							
-							// Begin calculating CFD score
-							if (calcMethod.cfd) {
-								/** "In other words, for the CFD score, a value of 0 
-								 *      indicates no predicted off-target activity whereas 
-								 *      a value of 1 indicates a perfect match"
-								 *      John Doench, 2016. 
-								 *      https://www.nature.com/articles/nbt.3437
-								*/
-								double cfdScore = 0;
-								if (dist == 0) {
-									cfdScore = 1;
-								}
-								else if (dist > 0 && dist <= maxDist) {
-									cfdScore = cfdPamPenalties[0b1010]; // PAM: NGG, TODO: do not hard-code the PAM
-									
-									for (size_t pos = 0; pos < 20; pos++) {
-										size_t mask = pos << 4;
-										
-										/** Create the mask to look up the position-identity score
-										 *      In Python... c2b is char to bit
-										 *       mask = pos << 4
-										 *       mask |= c2b[sgRNA[pos]] << 2
-										 *       mask |= c2b[revcom(offTaret[pos])]
-										 *      
-										 *      Find identity at `pos` for search signature
-										 *      example: find identity in pos=2
-										 *       Recall ISSL is inverted, hence:
-										 *                   3'-  T  G  C  C  G  A -5'
-										 *       start           11 10 01 01 10 00   
-										 *       3UL << pos*2    00 00 00 11 00 00 
-										 *       and             00 00 00 01 00 00
-										 *       shift           00 00 00 00 01 00
-										 */
-										uint64_t searchSigIdentityPos = searchSignature;
-										searchSigIdentityPos &= (3UL << (pos * 2));
-										searchSigIdentityPos = searchSigIdentityPos >> (pos * 2); 
-										searchSigIdentityPos = searchSigIdentityPos << 2;
-
-										/** Find identity at `pos` for offtarget
-										 *      Example: find identity in pos=2
-										 *      Recall ISSL is inverted, hence:
-										 *                  3'-  T  G  C  C  G  A -5'
-										 *      start           11 10 01 01 10 00   
-										 *      3UL<<pos*2      00 00 00 11 00 00 
-										 *      and             00 00 00 01 00 00
-										 *      shift           00 00 00 00 00 01
-										 *      rev comp 3UL    00 00 00 00 00 10 (done below)
-										 */
-										uint64_t offtargetIdentityPos = offtargets[signatureId];
-										offtargetIdentityPos &= (3UL << (pos * 2));
-										offtargetIdentityPos = offtargetIdentityPos >> (pos * 2); 
-
-										/** Complete the mask
-										 *      reverse complement (^3UL) `offtargetIdentityPos` here
-										 */
-										mask = (mask | searchSigIdentityPos | (offtargetIdentityPos ^ 3UL));
-
-										if (searchSigIdentityPos >> 2 != offtargetIdentityPos) {
-											cfdScore *= cfdPosPenalties[mask];
-										}
-									}
-								}
-								totScoreCfd += cfdScore * (double)occurrences;
-							}
-					
-							*ptrOfftargetFlag |= (1ULL << (signatureId % 64));
-							numOffTargetSitesScored += occurrences;
-
-							/** Stop calculating global score early if possible */
-							if (scoreMethod == ScoreMethod::mitAndCfd) {
-								if (totScoreMit > maximum_sum && totScoreCfd > maximum_sum) {
-									checkNextSlice = false;
-									break;
-								}
-							}
-							if (scoreMethod == ScoreMethod::mitOrCfd) {
-								if (totScoreMit > maximum_sum || totScoreCfd > maximum_sum) {
-									checkNextSlice = false;
-									break;
-								}
-							}
-							if (scoreMethod == ScoreMethod::avgMitCfd) {
-								if (((totScoreMit + totScoreCfd) / 2.0) > maximum_sum) {
-									checkNextSlice = false;
-									break;
-								}
-							}
-							if (scoreMethod == ScoreMethod::mit) {
-								if (totScoreMit > maximum_sum) {
-									checkNextSlice = false;
-									break;
-								}
-							}
-							if (scoreMethod == ScoreMethod::cfd) {
-								if (totScoreCfd > maximum_sum) {
-									checkNextSlice = false;
-									break;
-								}
-							}
-						}
-					}
-                }
-
-                if (!checkNextSlice)
-                    break;
-            }
-
-            querySignatureMitScores[searchIdx] = 10000.0 / (100.0 + totScoreMit);
-            querySignatureCfdScores[searchIdx] = 10000.0 / (100.0 + totScoreCfd);
-
-            memset(offtargetToggles.data(), 0, sizeof(uint64_t)*offtargetToggles.size());
-        }
-
-    }
-#endif
     /** Print global scores to stdout */
     for (size_t searchIdx = 0; searchIdx < querySignatures.size(); searchIdx++) {
         auto querySequence = signatureToSequence(querySignatures[searchIdx]);
