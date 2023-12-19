@@ -35,6 +35,16 @@ Consider using native compilation for the best performance on your system:
 
 using namespace std;
 
+#define gpuErrChk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr,"GPU Error: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+
 size_t seqLength, seqCount, sliceWidth, sliceCount, offtargetsCount, scoresCount;
 
 uint8_t nucleotideIndex[256];
@@ -172,6 +182,7 @@ __global__ void scoringCUDA(struct variScoringArgs* v_args) {
 
     continueCUDA = true;
 
+    /** For each off-target signature in slice */
     for (uint64_t j = index; j < signaturesInSlice; j += stride) {
         uint64_t signatureWithOccurrencesAndId = sliceOffset[j];
         uint64_t signatureId = signatureWithOccurrencesAndId & 0xFFFFFFFFull;
@@ -461,7 +472,7 @@ int main(int argc, char **argv)
 
     double* d_precalculatedScores;
     // This should take 8MB of VRAM, I don't think we will need to check free VRAM for this
-    cudaMalloc(&d_precalculatedScores, precalculatedScoresSize * sizeof(double));
+    gpuErrChk(cudaMalloc(&d_precalculatedScores, precalculatedScoresSize * sizeof(double)));
 
     for (int i = 0; i < scoresCount; i++) {
         uint64_t mask = 0;
@@ -484,15 +495,10 @@ int main(int argc, char **argv)
         precalculatedScores[mask_20bit] = score;
     }
 
-    cudaMemcpy(d_precalculatedScores, precalculatedScores.data(), precalculatedScoresSize * sizeof(double), cudaMemcpyHostToDevice);
-    
+    gpuErrChk(cudaMemcpy(d_precalculatedScores, precalculatedScores.data(), precalculatedScoresSize * sizeof(double), cudaMemcpyHostToDevice));
+
     /** Load in all of the off-target sites */
     uint64_t* offtargets;
-    // cudaMallocManaged(&offtargets, offtargetsCount * sizeof(uint64_t));
-    // if (fread(offtargets, sizeof(uint64_t), offtargetsCount, fp) == 0) {
-    //     fprintf(stderr, "Error reading index: loading off-target sequences failed\n");
-    //     return 1;
-    // }
 
     {
         size_t cuda_mem_free, cuda_mem_total;
@@ -502,14 +508,16 @@ int main(int argc, char **argv)
             // Not enough VRAM
             fprintf(stderr, "Not enough VRAM, using CUDA managed memory for offtargets\n");
             fprintf(stderr, "%zuMB Required\n", offtargetsCount * sizeof(uint64_t) / (1024*1024));
-            cudaMallocManaged(&offtargets, offtargetsCount * sizeof(uint64_t));
+
+            gpuErrChk(cudaMallocManaged(&offtargets, offtargetsCount * sizeof(uint64_t)));
+
             if (fread(offtargets, sizeof(uint64_t), offtargetsCount, fp) == 0) {
                 fprintf(stderr, "Error reading index: loading off-target sequences failed\n");
                 return 1;
             }
         } else {
             // Enough VRAM, use device memory
-            cudaMalloc(&offtargets, offtargetsCount * sizeof(uint64_t));
+            gpuErrChk(cudaMalloc(&offtargets, offtargetsCount * sizeof(uint64_t)));
 
             vector<uint64_t> offtargetsTemp(offtargetsCount);
             if (fread(offtargetsTemp.data(), sizeof(uint64_t), offtargetsCount, fp) == 0) {
@@ -517,7 +525,7 @@ int main(int argc, char **argv)
                 return 1;
             }
 
-            cudaMemcpy(offtargets, offtargetsTemp.data(), offtargetsCount * sizeof(uint64_t), cudaMemcpyHostToDevice);
+            gpuErrChk(cudaMemcpy(offtargets, offtargetsTemp.data(), offtargetsCount * sizeof(uint64_t), cudaMemcpyHostToDevice));
         }
     }
 
@@ -573,33 +581,16 @@ int main(int argc, char **argv)
             }
         } else {
             // Enough VRAM, use device memory
-            cudaMalloc(&allSignatures, allSignaturesSize);
+            gpuErrChk(cudaMalloc(&allSignatures, allSignaturesSize));
 
             vector<uint64_t> allSignaturesTemp(seqCount * sliceCount);
-            if (fread(allSignaturesTemp.data(), sizeof(uint64_t),
-                      allSignaturesSize, fp) == 0) {
+            if (fread(allSignaturesTemp.data(), sizeof(uint64_t), allSignaturesSize, fp) == 0) {
                 fprintf(stderr, "Error reading index: reading slice contents failed\n");
                 return 1;
             }
-            cudaMemcpy(allSignatures, allSignaturesTemp.data(),
-                       allSignaturesSize, cudaMemcpyHostToDevice);
+            gpuErrChk(cudaMemcpy(allSignatures, allSignaturesTemp.data(), allSignaturesSize, cudaMemcpyHostToDevice));
 
             // TODO: Read in chunks
-            // const size_t chunk_size = (8*1024*1024) / sizeof(uint64_t);
-            // vector<uint64_t> allSignaturesTemp(chunk_size);
-            // size_t left_to_read = allSignaturesSize-1;
-            // uint64_t *ptr = allSignaturesTemp.data();
-            // while (left_to_read > 0) {
-            //     size_t to_read = min(left_to_read, chunk_size * sizeof(uint64_t));
-            //     printf("Reading %zu\n", to_read);
-            //     if (fread(ptr, sizeof(uint64_t), to_read, fp) == 0) {
-            //         fprintf(stderr, "Error reading index: reading slice contents failed\n"); return 1;
-            //     }
-            //     cudaMemcpy(allSignatures, ptr, to_read,
-            //     cudaMemcpyHostToDevice); left_to_read -= to_read;
-            //     printf("Read %zu/%zu\n", allSignaturesSize - left_to_read,
-            //     allSignaturesSize);
-            // }
         }
     }
 
@@ -637,7 +628,8 @@ int main(int argc, char **argv)
     }
 
     if (signaturesLowMem) {
-        cudaMalloc(&d_someSignatures, maxSliceSize * sizeof(uint64_t) * sliceCount);
+        gpuErrChk(cudaMalloc(&d_someSignatures, maxSliceSize * sizeof(uint64_t) * sliceCount));
+
         fprintf(stderr, "Allocated %zuMB chunks for signatures\n", maxSliceSize * sizeof(uint64_t) * sliceCount / (1024*1024));
         // TODO: Figure out what happens if this doesn't fit in VRAM
     }
@@ -669,57 +661,58 @@ int main(int argc, char **argv)
     /** Binary encode query sequences */
 
     // Increase L1 cache size at the expense of shared memory (which we don't use)
-    cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
+    gpuErrChk(cudaDeviceSetCacheConfig(cudaFuncCachePreferL1));
 
     // Find the best block size
     int gridSize, blockSize;
-    cudaOccupancyMaxPotentialBlockSize(&gridSize, &blockSize, sequenceToSignatureCUDA, 0, queryCount);
+    gpuErrChk(cudaOccupancyMaxPotentialBlockSize(&gridSize, &blockSize, sequenceToSignatureCUDA, 0, queryCount));
 
     // Allocate VRAM for the query data
     uint8_t *d_queryDataSet;
     uint64_t *d_querySignatures;
-    cudaMalloc(&d_queryDataSet, queryCount * (seqLength + 1) * sizeof(uint8_t));
-    cudaMalloc(&d_querySignatures, queryCount * sizeof(uint64_t));
+    gpuErrChk(cudaMalloc(&d_queryDataSet, queryCount * (seqLength + 1) * sizeof(uint8_t)));
+    gpuErrChk(cudaMalloc(&d_querySignatures, queryCount * sizeof(uint64_t)));
 
     // Copy the query data to the VRAM
-    cudaMemcpy(d_queryDataSet, &queryDataSet[0], queryCount * (seqLength + 1) * sizeof(uint8_t), cudaMemcpyHostToDevice);
+    gpuErrChk(cudaMemcpy(d_queryDataSet, &queryDataSet[0], queryCount * (seqLength + 1) * sizeof(uint8_t), cudaMemcpyHostToDevice));
 
     // Calculate the signatures
     sequenceToSignatureCUDA<<<blockSize, gridSize>>>(queryCount, seqLength, d_queryDataSet, d_querySignatures);
+    gpuErrChk(cudaGetLastError());
 
     // Wait for CUDA to finish
-    cudaDeviceSynchronize();
+    gpuErrChk(cudaDeviceSynchronize());
 
     // Free VRAM and copy the signatures back to system RAM
-    cudaFree(d_queryDataSet);
-    cudaMemcpy(&querySignatures[0], d_querySignatures, queryCount * sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    cudaFree(d_querySignatures);
+    gpuErrChk(cudaFree(d_queryDataSet));
+    gpuErrChk(cudaMemcpy(&querySignatures[0], d_querySignatures, queryCount * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    gpuErrChk(cudaFree(d_querySignatures));
 
     // Allocate VRAM for various variables
     double *d_cfdPamPenalties;
     double *d_cfdPosPenalties;
-    cudaMalloc(&d_cfdPamPenalties, sizeof(cfdPamPenalties));
-    cudaMalloc(&d_cfdPosPenalties, sizeof(cfdPosPenalties));
-    cudaMemcpy(d_cfdPamPenalties, cfdPamPenalties, sizeof(cfdPamPenalties), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_cfdPosPenalties, cfdPosPenalties, sizeof(cfdPosPenalties), cudaMemcpyHostToDevice);
+    gpuErrChk(cudaMalloc(&d_cfdPamPenalties, sizeof(cfdPamPenalties)));
+    gpuErrChk(cudaMalloc(&d_cfdPosPenalties, sizeof(cfdPosPenalties)));
+    gpuErrChk(cudaMemcpy(d_cfdPamPenalties, cfdPamPenalties, sizeof(cfdPamPenalties), cudaMemcpyHostToDevice));
+    gpuErrChk(cudaMemcpy(d_cfdPosPenalties, cfdPosPenalties, sizeof(cfdPosPenalties), cudaMemcpyHostToDevice));
 
     uint64_t *d_offtargetToggles;
-    cudaMalloc(&d_offtargetToggles, numOfftargetToggles * sizeof(uint64_t));
-    cudaMemset(d_offtargetToggles, 0, numOfftargetToggles * sizeof(uint64_t));
+    gpuErrChk(cudaMalloc(&d_offtargetToggles, numOfftargetToggles * sizeof(uint64_t)));
+    gpuErrChk(cudaMemset(d_offtargetToggles, 0, numOfftargetToggles * sizeof(uint64_t)));
     uint64_t *d_offtargetTogglesTail = d_offtargetToggles + numOfftargetToggles - 1;
 
     double *d_totScoreMit;
     double *d_totScoreCfd;
-    cudaMalloc(&d_totScoreMit, sizeof(double));
-    cudaMalloc(&d_totScoreCfd, sizeof(double));
+    gpuErrChk(cudaMalloc(&d_totScoreMit, sizeof(double)));
+    gpuErrChk(cudaMalloc(&d_totScoreCfd, sizeof(double)));
 
     uint32_t *d_numOffTargetSitesScored;
-    cudaMalloc(&d_numOffTargetSitesScored, sizeof(int));
+    gpuErrChk(cudaMalloc(&d_numOffTargetSitesScored, sizeof(int)));
 
     // Mapped memory for checkNextSlice
     bool *h_checkNextSlice, *d_checkNextSlice;
-    cudaHostAlloc(&h_checkNextSlice, sizeof(bool), cudaHostAllocMapped);
-    cudaHostGetDevicePointer(&d_checkNextSlice, h_checkNextSlice, 0);
+    gpuErrChk(cudaHostAlloc(&h_checkNextSlice, sizeof(bool), cudaHostAllocMapped));
+    gpuErrChk(cudaHostGetDevicePointer(&d_checkNextSlice, h_checkNextSlice, 0));
 
     // 256 byte limit on the number of arguments to a kernel, so we use structs
     // This one stays in constant memory however
@@ -738,18 +731,18 @@ int main(int argc, char **argv)
         .checkNextSlice = d_checkNextSlice,
     };
     // Copy to constant memory
-    cudaMemcpyToSymbol(d_constant_args, &constant_args, sizeof(struct constScoringArgs));
+    gpuErrChk(cudaMemcpyToSymbol(d_constant_args, &constant_args, sizeof(struct constScoringArgs)));
 
     // Pinned memory for slice args
     struct variScoringArgs *slice_args;
     struct variScoringArgs *d_slice_args;
-    cudaMallocHost(&slice_args, sizeof(struct variScoringArgs));
-    cudaMalloc(&d_slice_args, sizeof(struct variScoringArgs));
+    gpuErrChk(cudaMallocHost(&slice_args, sizeof(struct variScoringArgs)));
+    gpuErrChk(cudaMalloc(&d_slice_args, sizeof(struct variScoringArgs)));
 
     unordered_map<uint64_t, unordered_set<uint64_t>> searchResults;
 
     // Recalculate the block size for the scoring kernel
-    cudaOccupancyMaxPotentialBlockSize(&gridSize, &blockSize, scoringCUDA, 0, maxSliceSize);
+    gpuErrChk(cudaOccupancyMaxPotentialBlockSize(&gridSize, &blockSize, scoringCUDA, 0, maxSliceSize));
 
     // TODO: Remove once figured out
     int skipped = 0;
@@ -794,8 +787,6 @@ int main(int argc, char **argv)
 
             uint64_t *sliceOffset = signaturesLowMem ? (d_someSignatures + i * maxSliceSize) : sliceLists[i][searchSlice];
 
-            /** For each off-target signature in slice */
-
             *slice_args = {
                 .sliceOffset = sliceOffset,
                 .signaturesInSlice = signaturesInSlice,
@@ -832,18 +823,7 @@ int main(int argc, char **argv)
     printf("Skipped %d\n", skipped);
 
     // Free VRAM
-    cudaFree(d_cfdPamPenalties);
-    cudaFree(d_cfdPosPenalties);
-    cudaFree(d_offtargetToggles);
-    cudaFree(d_totScoreMit);
-    cudaFree(d_totScoreCfd);
-    cudaFree(d_numOffTargetSitesScored);
-    cudaFree(d_someSignatures);
-    cudaFreeHost(slice_args);
-    cudaFree(d_slice_args);
-    cudaFreeHost(h_checkNextSlice);
-
-    cudaDeviceReset();
+    gpuErrChk(cudaDeviceReset());
 
     /** Print global scores to stdout */
     for (size_t searchIdx = 0; searchIdx < querySignatures.size(); searchIdx++) {
