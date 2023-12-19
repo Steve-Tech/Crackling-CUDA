@@ -552,17 +552,21 @@ int main(int argc, char **argv)
      */
     // vector<uint64_t> allSignatures(seqCount * sliceCount);
     uint64_t *allSignatures;
+    uint64_t *d_someSignatures;  // Used when not enough VRAM
+    bool signaturesLowMem;
     {
         size_t cuda_mem_free, cuda_mem_total;
         cudaMemGetInfo(&cuda_mem_free, &cuda_mem_total);
 
         size_t allSignaturesSize = seqCount * sliceCount * sizeof(uint64_t);
-        if (allSignaturesSize > cuda_mem_free) {
+        signaturesLowMem = allSignaturesSize > cuda_mem_free;
+        if (signaturesLowMem) {
             // Not enough VRAM
-            fprintf(stderr, "Not enough VRAM, using CUDA managed memory for signatures\n");
+            fprintf(stderr, "Not enough VRAM, using small chunks for signatures\n");
             fprintf(stderr, "%zuMB Required\n", allSignaturesSize / (1024*1024));
 
-            cudaMallocManaged(&allSignatures, allSignaturesSize);
+            // cudaMallocManaged(&allSignatures, allSignaturesSize);
+            allSignatures = (uint64_t*)malloc(allSignaturesSize);
             if (fread(allSignatures, sizeof(uint64_t), allSignaturesSize, fp) == 0) {
                 fprintf(stderr, "Error reading index: reading slice contents failed\n");
                 return 1;
@@ -630,6 +634,12 @@ int main(int argc, char **argv)
             offset += allSlicelistSizes[idx];
             maxSliceSize = max(maxSliceSize, allSlicelistSizes[idx]);
         }
+    }
+
+    if (signaturesLowMem) {
+        cudaMalloc(&d_someSignatures, maxSliceSize * sizeof(uint64_t) * sliceCount);
+        fprintf(stderr, "Allocated %zuMB chunks for signatures\n", maxSliceSize * sizeof(uint64_t) * sliceCount / (1024*1024));
+        // TODO: Figure out what happens if this doesn't fit in VRAM
     }
     
     /** Load query file (candidate guides)
@@ -758,18 +768,31 @@ int main(int argc, char **argv)
 
         *h_checkNextSlice = true;
 
-        /** For each ISSL slice */
+        vector<uint64_t> searchSlices(sliceCount);
+
+        /** Prepare each ISSL slice */
         for (size_t i = 0; i < sliceCount; i++) {
             uint64_t sliceMask = sliceLimit - 1;
             size_t sliceShift = sliceWidth * i;
             sliceMask = sliceMask << sliceShift;
             
             uint64_t searchSlice = (searchSignature & sliceMask) >> sliceShift;
+            searchSlices[i] = searchSlice;
+
+            if (signaturesLowMem) {
+                cudaMemcpy(d_someSignatures + i * maxSliceSize, sliceLists[i][searchSlice], allSlicelistSizes[i * sliceLimit + searchSlice] * sizeof(uint64_t), cudaMemcpyHostToDevice);
+            }
+        }
+
+        /** Calculate each ISSL slice */
+        for (size_t i = 0; i < sliceCount; i++) {
+            uint64_t &searchSlice = searchSlices[i];
             
             size_t idx = i * sliceLimit + searchSlice;
             
             size_t signaturesInSlice = allSlicelistSizes[idx];
-            uint64_t *sliceOffset = sliceLists[i][searchSlice];
+
+            uint64_t *sliceOffset = signaturesLowMem ? (d_someSignatures + i * maxSliceSize) : sliceLists[i][searchSlice];
 
             /** For each off-target signature in slice */
 
@@ -815,6 +838,7 @@ int main(int argc, char **argv)
     cudaFree(d_totScoreMit);
     cudaFree(d_totScoreCfd);
     cudaFree(d_numOffTargetSitesScored);
+    cudaFree(d_someSignatures);
     cudaFreeHost(slice_args);
     cudaFree(d_slice_args);
     cudaFreeHost(h_checkNextSlice);
