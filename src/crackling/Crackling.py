@@ -198,7 +198,7 @@ def Crackling(configMngr):
                     parsedFile.write('\n'+line+'\n')
                 else:
                     # this is (part of) the sequence; we write it without line break
-                    parsedFile.write(line.strip())
+                    parsedFile.write(line)
 
 
         with open(parsedFile.name, 'r') as inFile:
@@ -235,7 +235,7 @@ def Crackling(configMngr):
                 # Sequence line, section of existing sequence
                 else:
                     # Append section to total sequence
-                    seq += line.strip()
+                    seq += line
 
             # Process the last sequence
             for guide in processSequence(seq):
@@ -782,58 +782,34 @@ def Crackling(configMngr):
                 with open(configMngr['offtargetscore']['output'], 'r') as fTargetsScored:
                     for targetScored in [x.split('\t') for x in fTargetsScored.readlines()]:
                         if len(targetScored) == 3:
-                            targetsScored[targetScored[0]] = {'MIT': -1.0, 'CFD': -1.0}
-                            targetsScored[targetScored[0]]['MIT'] = float(targetScored[1].strip())
-                            targetsScored[targetScored[0]]['CFD'] = float(targetScored[2].strip())
+                            targetsScored[targetScored[0]] = \
+                                {'MIT': float(targetScored[1].strip()),
+                                'CFD': float(targetScored[2].strip())}
+
+                scoreThreshold = float(configMngr['offtargetscore']['score-threshold'])
+                scoreMethod = str(configMngr['offtargetscore']['method']).strip().lower()
+                # Create a dictionary of scoring methods
+                score_methods = {
+                    'mit': lambda score: score['MIT'] < scoreThreshold,
+                    'cfd': lambda score: score['CFD'] < scoreThreshold,
+                    'and': lambda score: (score['MIT'] < scoreThreshold) and (score['CFD'] < scoreThreshold),
+                    'or': lambda score: (score['MIT'] < scoreThreshold) or (score['CFD'] < scoreThreshold),
+                    'avg': lambda score: ((score['MIT'] + score['CFD'])/2) < scoreThreshold,
+                }
 
                 failedCount = 0
                 for target23 in pageCandidateGuides:
-                    if target23[0:20] in targetsScored:
-                        score = targetsScored[target23[0:20]]
+                    target = target23[0:20]
+                    if target in targetsScored:
+                        score = targetsScored[target]
                         candidateGuides[target23]['mitOfftargetscore'] = score['MIT']
                         candidateGuides[target23]['cfdOfftargetscore'] = score['CFD']
-                        scoreThreshold = float(configMngr['offtargetscore']['score-threshold'])
-                        scoreMethod = str(configMngr['offtargetscore']['method']).strip().lower()
 
-                        # MIT
-                        if scoreMethod == 'mit':
-                            if score['MIT'] < scoreThreshold:
-                                candidateGuides[target23]['passedOffTargetScore'] = CODE_REJECTED
-                                failedCount += 1
-                            else:
-                                candidateGuides[target23]['passedOffTargetScore'] = CODE_ACCEPTED
-
-                        # CFD
-                        elif scoreMethod == 'cfd':
-                            if score['CFD'] < scoreThreshold:
-                                candidateGuides[target23]['passedOffTargetScore'] = CODE_REJECTED
-                                failedCount += 1
-                            else:
-                                candidateGuides[target23]['passedOffTargetScore'] = CODE_ACCEPTED
-
-                        # AND
-                        elif scoreMethod == 'and':
-                            if (score['MIT'] < scoreThreshold) and (score['CFD'] < scoreThreshold):
-                                candidateGuides[target23]['passedOffTargetScore'] = CODE_REJECTED
-                                failedCount += 1
-                            else:
-                                candidateGuides[target23]['passedOffTargetScore'] = CODE_ACCEPTED
-
-                        # OR
-                        elif scoreMethod == 'or':
-                            if (score['MIT'] < scoreThreshold) or (score['CFD'] < scoreThreshold):
-                                candidateGuides[target23]['passedOffTargetScore'] = CODE_REJECTED
-                                failedCount += 1
-                            else:
-                                candidateGuides[target23]['passedOffTargetScore'] = CODE_ACCEPTED
-
-                        # AVERAGE
-                        elif scoreMethod == 'avg':
-                            if ((score['MIT'] + score['CFD'])/2) < scoreThreshold:
-                                candidateGuides[target23]['passedOffTargetScore'] = CODE_REJECTED
-                                failedCount += 1
-                            else:
-                                candidateGuides[target23]['passedOffTargetScore'] = CODE_ACCEPTED
+                        if score_methods[scoreMethod](score):
+                            candidateGuides[target23]['passedOffTargetScore'] = CODE_REJECTED
+                            failedCount += 1
+                        else:
+                            candidateGuides[target23]['passedOffTargetScore'] = CODE_ACCEPTED
 
                 printer(f'\t{failedCount:,} of {testedCount:,} failed here.')
 

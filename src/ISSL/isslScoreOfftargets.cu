@@ -101,7 +101,7 @@ string signatureToSequence(uint64_t signature)
 }
 
 __global__
-void sequenceToSignatureCUDA(size_t queryCount, size_t seqLength, uint8_t *queryDataSet, uint64_t *querySignatures)
+void sequenceToSignatureCUDA(uint64_t queryCount, uint64_t seqLength, uint8_t *queryDataSet, uint64_t *querySignatures)
 {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
@@ -113,11 +113,11 @@ void sequenceToSignatureCUDA(size_t queryCount, size_t seqLength, uint8_t *query
     nucleotideIndex['G'] = 2;
     nucleotideIndex['T'] = 3;
 
-    for (size_t i = index; i < queryCount; i += stride) {
+    for (uint64_t i = index; i < queryCount; i += stride) {
         uint8_t *ptr = &queryDataSet[i * (seqLength + 1)]; // (seqLength + 1) == seqLineLength
 
         uint64_t signature = 0;
-        for (size_t j = 0; j < seqLength; j++) {
+        for (uint32_t j = 0; j < seqLength; j++) {
             signature |= (uint64_t)(nucleotideIndex[*ptr]) << (j * 2);
             ptr++;
         }
@@ -142,20 +142,13 @@ struct constScoringArgs {
             bool *checkNextSlice;
 };
 
-struct variScoringArgs {
-            uint64_t *sliceOffset;
-            uint64_t signaturesInSlice;
-            uint64_t searchSignature;
-            double maximum_sum;
-};
-
 // This should be faster to read on the GPU than checkNextSlice (which is on the CPU)
 __device__ bool continueCUDA = true;
 
 // Makes use of constant memory
 __constant__ struct constScoringArgs d_constant_args;
 
-__global__ void scoringCUDA(struct variScoringArgs* v_args) {
+__global__ void scoringCUDA(uint64_t *sliceOffset, const uint64_t signaturesInSlice, const uint64_t searchSignature, const double maximum_sum) {
     // Extract constScoringArgs into easier to use variables
     uint64_t *offtargets = d_constant_args.offtargets;
     uint64_t *offtargetTogglesTail = d_constant_args.offtargetTogglesTail;
@@ -169,13 +162,6 @@ __global__ void scoringCUDA(struct variScoringArgs* v_args) {
     double &totScoreCfd = *d_constant_args.totScoreCfd;
     uint32_t &numOffTargetSitesScored = *d_constant_args.numOffTargetSitesScored;
     bool &checkNextSlice = *d_constant_args.checkNextSlice;
-
-    // Extract variScoringArgs into easier to use variables
-    // References seemed slow, but only here, not above
-    uint64_t *sliceOffset = v_args->sliceOffset;
-    const uint64_t signaturesInSlice = v_args->signaturesInSlice;
-    const uint64_t searchSignature = v_args->searchSignature;
-    const double maximum_sum = v_args->maximum_sum;
 
     uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t stride = blockDim.x * gridDim.x;
@@ -233,6 +219,7 @@ __global__ void scoringCUDA(struct variScoringArgs* v_args) {
                     if (dist > 0) {
                         // totScoreMit += precalculatedScores[mismatches] * (double)occurrences;
 
+                        // Calculate index of precalculatedScores
                         uint64_t mask_40bit = mismatches;
                         uint32_t mask_20bit = 0;
                         uint32_t shift = 0;
@@ -453,6 +440,11 @@ int main(int argc, char **argv)
     sliceWidth      = slicelistHeader[3]; 
     sliceCount      = slicelistHeader[4]; 
     scoresCount     = slicelistHeader[5]; 
+
+    // Create a CUDA stream for async operations, hardware also has a seperate queue for device-to-host
+    cudaStream_t stream, streamD2H;
+    cudaStreamCreate(&stream);
+    cudaStreamCreate(&streamD2H);
     
     /** The maximum number of possibly slice identities
      *      4 chars per slice * each of A,T,C,G = limit of 16
@@ -467,12 +459,12 @@ int main(int argc, char **argv)
      *      - `score` is the local MIT score for this mismatch combination
      */
     // phmap::flat_hash_map<uint64_t, double> precalculatedScores;
-    const size_t precalculatedScoresSize = (1 << 20) - 1; // 20 bit mask
+    const uint_fast32_t precalculatedScoresSize = (1 << 20) - 1; // 20 bit mask
     vector<double> precalculatedScores(precalculatedScoresSize, -1.0);
 
     double* d_precalculatedScores;
     // This should take 8MB of VRAM, I don't think we will need to check free VRAM for this
-    gpuErrChk(cudaMalloc(&d_precalculatedScores, precalculatedScoresSize * sizeof(double)));
+    gpuErrChk(cudaMallocAsync(&d_precalculatedScores, precalculatedScoresSize * sizeof(double), stream));
 
     for (int i = 0; i < scoresCount; i++) {
         uint64_t mask = 0;
@@ -495,7 +487,7 @@ int main(int argc, char **argv)
         precalculatedScores[mask_20bit] = score;
     }
 
-    gpuErrChk(cudaMemcpy(d_precalculatedScores, precalculatedScores.data(), precalculatedScoresSize * sizeof(double), cudaMemcpyHostToDevice));
+    gpuErrChk(cudaMemcpyAsync(d_precalculatedScores, precalculatedScores.data(), precalculatedScoresSize * sizeof(double), cudaMemcpyHostToDevice, stream));
 
     /** Load in all of the off-target sites */
     uint64_t* offtargets;
@@ -525,6 +517,7 @@ int main(int argc, char **argv)
                 return 1;
             }
 
+            // Can't use Async here, since the vector will be destroyed after this scope
             gpuErrChk(cudaMemcpy(offtargets, offtargetsTemp.data(), offtargetsCount * sizeof(uint64_t), cudaMemcpyHostToDevice));
         }
     }
@@ -588,6 +581,7 @@ int main(int argc, char **argv)
                 fprintf(stderr, "Error reading index: reading slice contents failed\n");
                 return 1;
             }
+            // Can't use Async here, since the vector will be destroyed after this scope
             gpuErrChk(cudaMemcpy(allSignatures, allSignaturesTemp.data(), allSignaturesSize, cudaMemcpyHostToDevice));
 
             // TODO: Read in chunks
@@ -674,7 +668,7 @@ int main(int argc, char **argv)
     gpuErrChk(cudaMalloc(&d_querySignatures, queryCount * sizeof(uint64_t)));
 
     // Copy the query data to the VRAM
-    gpuErrChk(cudaMemcpy(d_queryDataSet, &queryDataSet[0], queryCount * (seqLength + 1) * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    gpuErrChk(cudaMemcpy(d_queryDataSet, queryDataSet.data(), queryCount * (seqLength + 1) * sizeof(uint8_t), cudaMemcpyHostToDevice));
 
     // Calculate the signatures
     sequenceToSignatureCUDA<<<blockSize, gridSize>>>(queryCount, seqLength, d_queryDataSet, d_querySignatures);
@@ -685,29 +679,29 @@ int main(int argc, char **argv)
 
     // Free VRAM and copy the signatures back to system RAM
     gpuErrChk(cudaFree(d_queryDataSet));
-    gpuErrChk(cudaMemcpy(&querySignatures[0], d_querySignatures, queryCount * sizeof(uint64_t), cudaMemcpyDeviceToHost));
-    gpuErrChk(cudaFree(d_querySignatures));
+    gpuErrChk(cudaMemcpyAsync(querySignatures.data(), d_querySignatures, queryCount * sizeof(uint64_t), cudaMemcpyDeviceToHost, streamD2H));
+    gpuErrChk(cudaFreeAsync(d_querySignatures, streamD2H));
 
     // Allocate VRAM for various variables
     double *d_cfdPamPenalties;
     double *d_cfdPosPenalties;
-    gpuErrChk(cudaMalloc(&d_cfdPamPenalties, sizeof(cfdPamPenalties)));
-    gpuErrChk(cudaMalloc(&d_cfdPosPenalties, sizeof(cfdPosPenalties)));
-    gpuErrChk(cudaMemcpy(d_cfdPamPenalties, cfdPamPenalties, sizeof(cfdPamPenalties), cudaMemcpyHostToDevice));
-    gpuErrChk(cudaMemcpy(d_cfdPosPenalties, cfdPosPenalties, sizeof(cfdPosPenalties), cudaMemcpyHostToDevice));
+    gpuErrChk(cudaMallocAsync(&d_cfdPamPenalties, sizeof(cfdPamPenalties), stream));
+    gpuErrChk(cudaMallocAsync(&d_cfdPosPenalties, sizeof(cfdPosPenalties), stream));
+    gpuErrChk(cudaMemcpyAsync(d_cfdPamPenalties, cfdPamPenalties, sizeof(cfdPamPenalties), cudaMemcpyHostToDevice, stream));
+    gpuErrChk(cudaMemcpyAsync(d_cfdPosPenalties, cfdPosPenalties, sizeof(cfdPosPenalties), cudaMemcpyHostToDevice, stream));
 
     uint64_t *d_offtargetToggles;
-    gpuErrChk(cudaMalloc(&d_offtargetToggles, numOfftargetToggles * sizeof(uint64_t)));
-    gpuErrChk(cudaMemset(d_offtargetToggles, 0, numOfftargetToggles * sizeof(uint64_t)));
+    gpuErrChk(cudaMallocAsync(&d_offtargetToggles, numOfftargetToggles * sizeof(uint64_t), stream));
+    gpuErrChk(cudaMemsetAsync(d_offtargetToggles, 0, numOfftargetToggles * sizeof(uint64_t), stream));
     uint64_t *d_offtargetTogglesTail = d_offtargetToggles + numOfftargetToggles - 1;
 
     double *d_totScoreMit;
     double *d_totScoreCfd;
-    gpuErrChk(cudaMalloc(&d_totScoreMit, sizeof(double)));
-    gpuErrChk(cudaMalloc(&d_totScoreCfd, sizeof(double)));
+    gpuErrChk(cudaMallocAsync(&d_totScoreMit, sizeof(double), stream));
+    gpuErrChk(cudaMallocAsync(&d_totScoreCfd, sizeof(double), stream));
 
     uint32_t *d_numOffTargetSitesScored;
-    gpuErrChk(cudaMalloc(&d_numOffTargetSitesScored, sizeof(int)));
+    gpuErrChk(cudaMallocAsync(&d_numOffTargetSitesScored, sizeof(int), stream));
 
     // Mapped memory for checkNextSlice
     bool *h_checkNextSlice, *d_checkNextSlice;
@@ -731,21 +725,12 @@ int main(int argc, char **argv)
         .checkNextSlice = d_checkNextSlice,
     };
     // Copy to constant memory
-    gpuErrChk(cudaMemcpyToSymbol(d_constant_args, &constant_args, sizeof(struct constScoringArgs)));
-
-    // Pinned memory for slice args
-    struct variScoringArgs *slice_args;
-    struct variScoringArgs *d_slice_args;
-    gpuErrChk(cudaMallocHost(&slice_args, sizeof(struct variScoringArgs)));
-    gpuErrChk(cudaMalloc(&d_slice_args, sizeof(struct variScoringArgs)));
+    gpuErrChk(cudaMemcpyToSymbolAsync(d_constant_args, &constant_args, sizeof(struct constScoringArgs), 0, cudaMemcpyHostToDevice, stream));
 
     unordered_map<uint64_t, unordered_set<uint64_t>> searchResults;
 
     // Recalculate the block size for the scoring kernel
     gpuErrChk(cudaOccupancyMaxPotentialBlockSize(&gridSize, &blockSize, scoringCUDA, 0, maxSliceSize));
-
-    // TODO: Remove once figured out
-    int skipped = 0;
 
     /** For each candidate guide */
     for (size_t searchIdx = 0; searchIdx < querySignatures.size(); searchIdx++) {
@@ -753,10 +738,10 @@ int main(int argc, char **argv)
         auto searchSignature = querySignatures[searchIdx];
 
         /** Global scores */
-        cudaMemset(d_totScoreMit, 0, sizeof(double));  // totScoreMit = 0.0;
-        cudaMemset(d_totScoreCfd, 0, sizeof(double));  // totScoreCfd = 0.0;
+        cudaMemsetAsync(d_totScoreMit, 0, sizeof(double), stream);  // totScoreMit = 0.0;
+        cudaMemsetAsync(d_totScoreCfd, 0, sizeof(double), stream);  // totScoreCfd = 0.0;
         
-        cudaMemset(d_numOffTargetSitesScored, 0, sizeof(int));  // numOffTargetSitesScored = 0;
+        cudaMemsetAsync(d_numOffTargetSitesScored, 0, sizeof(int), stream);  // numOffTargetSitesScored = 0;
         double maximum_sum = (10000.0 - threshold*100) / threshold;
 
         *h_checkNextSlice = true;
@@ -773,7 +758,8 @@ int main(int argc, char **argv)
             searchSlices[i] = searchSlice;
 
             if (signaturesLowMem) {
-                cudaMemcpy(d_someSignatures + i * maxSliceSize, sliceLists[i][searchSlice], allSlicelistSizes[i * sliceLimit + searchSlice] * sizeof(uint64_t), cudaMemcpyHostToDevice);
+                cudaMemcpyAsync(d_someSignatures + i * maxSliceSize, sliceLists[i][searchSlice],
+                allSlicelistSizes[i * sliceLimit + searchSlice] * sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
             }
         }
 
@@ -787,40 +773,29 @@ int main(int argc, char **argv)
 
             uint64_t *sliceOffset = signaturesLowMem ? (d_someSignatures + i * maxSliceSize) : sliceLists[i][searchSlice];
 
-            *slice_args = {
-                .sliceOffset = sliceOffset,
-                .signaturesInSlice = signaturesInSlice,
-                .searchSignature = searchSignature,
-                .maximum_sum = maximum_sum,
-            };
-
-            // Check last run to see if we should continue
+            // Check last run to see if we should continue, also syncs the stream
             cudaDeviceSynchronize();
             if (!*h_checkNextSlice) {
-                skipped++;
                 break;
             }
 
-            cudaMemcpy(d_slice_args, slice_args, sizeof(struct variScoringArgs), cudaMemcpyHostToDevice);
-
-            scoringCUDA<<<blockSize, gridSize>>>(d_slice_args);
+            scoringCUDA<<<blockSize, gridSize>>>(sliceOffset, signaturesInSlice, searchSignature, maximum_sum);
             // Continue next iteration to prepare the next run
         }
         cudaDeviceSynchronize();
 
+        // memset(offtargetToggles.data(), 0, sizeof(uint64_t)*offtargetToggles.size());
+        cudaMemsetAsync(d_offtargetToggles, 0, numOfftargetToggles * sizeof(uint64_t), stream);
+
         double totScoreMit = 0.0;
         double totScoreCfd = 0.0;
-        cudaMemcpy(&totScoreMit, d_totScoreMit, sizeof(double), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&totScoreCfd, d_totScoreCfd, sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpyAsync(&totScoreMit, d_totScoreMit, sizeof(double), cudaMemcpyDeviceToHost, streamD2H);
+        cudaMemcpyAsync(&totScoreCfd, d_totScoreCfd, sizeof(double), cudaMemcpyDeviceToHost, streamD2H);
 
+        cudaStreamSynchronize(streamD2H);
         querySignatureMitScores[searchIdx] = 10000.0 / (100.0 + totScoreMit);
         querySignatureCfdScores[searchIdx] = 10000.0 / (100.0 + totScoreCfd);
-
-        // memset(offtargetToggles.data(), 0, sizeof(uint64_t)*offtargetToggles.size());
-        cudaMemset(d_offtargetToggles, 0, numOfftargetToggles * sizeof(uint64_t));
     }
-
-    printf("Skipped %d\n", skipped);
 
     // Free VRAM
     gpuErrChk(cudaDeviceReset());
