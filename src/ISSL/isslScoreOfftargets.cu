@@ -47,8 +47,8 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
 
 size_t seqLength, seqCount, sliceWidth, sliceCount, offtargetsCount, scoresCount;
 
-uint8_t nucleotideIndex[256];
-vector<char> signatureIndex(4);
+// uint8_t nucleotideIndex[128];
+const char signatureIndex[4] = { 'A', 'C', 'G', 'T' };
 enum ScoreMethod { unknown = 0, mit = 1, cfd = 2, mitAndCfd = 3, mitOrCfd = 4, avgMitCfd = 5 };
 struct CalcMethod { 
     bool mit;
@@ -61,25 +61,6 @@ size_t getFileSize(const char *path)
     struct stat64 statBuf;
     stat64(path, &statBuf);
     return statBuf.st_size;
-}
-
-/**
- * Binary encode genetic string `ptr`
- *
- * For example, 
- *   ATCG becomes
- *   00 11 01 10  (buffer with leading zeroes to encode as 64-bit unsigned int)
- *
- * @param[in] ptr the string containing ATCG to binary encode
- */
-uint64_t sequenceToSignature(const char *ptr)
-{
-    uint64_t signature = 0;
-    for (size_t j = 0; j < seqLength; j++) {
-        signature |= (uint64_t)(nucleotideIndex[*ptr]) << (j * 2);
-        ptr++;
-    }
-    return signature;
 }
 
 /**
@@ -100,25 +81,38 @@ string signatureToSequence(uint64_t signature)
     return sequence;
 }
 
-__global__
-void sequenceToSignatureCUDA(uint64_t queryCount, uint64_t seqLength, uint8_t *queryDataSet, uint64_t *querySignatures)
+/**
+ * Binary encode genetic string `ptr`
+ *
+ * For example, 
+ *   ATCG becomes
+ *   00 11 01 10  (buffer with leading zeroes to encode as 64-bit unsigned int)
+ *
+ * @param[in] ptr the string containing ATCG to binary encode
+ */
+// uint64_t sequenceToSignature(const char *ptr)
+// {
+//     uint64_t signature = 0;
+//     for (size_t j = 0; j < seqLength; j++) {
+//         signature |= (uint64_t)(nucleotideIndex[*ptr]) << (j * 2);
+//         ptr++;
+//     }
+//     return signature;
+// }
+                                // This format usually isn't allowed in C++, but it works in CUDA
+__constant__ uint8_t d_nucleotideIndex[128] = { ['A'] = 0, ['C'] = 1, ['G'] = 2, ['T'] = 3 };
+
+__global__ void sequenceToSignatureCUDA(uint64_t queryCount, uint64_t seqLength, uint8_t *queryDataSet, uint64_t *querySignatures)
 {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-
-    uint8_t nucleotideIndex[256];
-
-    nucleotideIndex['A'] = 0;
-    nucleotideIndex['C'] = 1;
-    nucleotideIndex['G'] = 2;
-    nucleotideIndex['T'] = 3;
+    const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t stride = blockDim.x * gridDim.x;
 
     for (uint64_t i = index; i < queryCount; i += stride) {
         uint8_t *ptr = &queryDataSet[i * (seqLength + 1)]; // (seqLength + 1) == seqLineLength
 
         uint64_t signature = 0;
         for (uint32_t j = 0; j < seqLength; j++) {
-            signature |= (uint64_t)(nucleotideIndex[*ptr]) << (j * 2);
+            signature |= (uint64_t)(d_nucleotideIndex[*ptr]) << (j * 2);
             ptr++;
         }
 
@@ -150,21 +144,21 @@ __constant__ struct constScoringArgs d_constant_args;
 
 __global__ void scoringCUDA(uint64_t *sliceOffset, const uint64_t signaturesInSlice, const uint64_t searchSignature, const double maximum_sum) {
     // Extract constScoringArgs into easier to use variables
-    uint64_t *offtargets = d_constant_args.offtargets;
-    uint64_t *offtargetTogglesTail = d_constant_args.offtargetTogglesTail;
-    const uint32_t maxDist = d_constant_args.maxDist;
-    const CalcMethod calcMethod = d_constant_args.calcMethod;
-    const ScoreMethod scoreMethod = d_constant_args.scoreMethod;
-    double *precalculatedScores = d_constant_args.precalculatedScores;
-    double *cfdPamPenalties = d_constant_args.cfdPamPenalties;
-    double *cfdPosPenalties = d_constant_args.cfdPosPenalties;
+    uint64_t *&offtargets = d_constant_args.offtargets;
+    uint64_t *&offtargetTogglesTail = d_constant_args.offtargetTogglesTail;
+    const uint32_t &maxDist = d_constant_args.maxDist;
+    const CalcMethod &calcMethod = d_constant_args.calcMethod;
+    const ScoreMethod &scoreMethod = d_constant_args.scoreMethod;
+    double *&precalculatedScores = d_constant_args.precalculatedScores;
+    double *&cfdPamPenalties = d_constant_args.cfdPamPenalties;
+    double *&cfdPosPenalties = d_constant_args.cfdPosPenalties;
     double &totScoreMit = *d_constant_args.totScoreMit;
     double &totScoreCfd = *d_constant_args.totScoreCfd;
     uint32_t &numOffTargetSitesScored = *d_constant_args.numOffTargetSitesScored;
     bool &checkNextSlice = *d_constant_args.checkNextSlice;
 
-    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t stride = blockDim.x * gridDim.x;
+    const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t stride = blockDim.x * gridDim.x;
 
     continueCUDA = true;
 
@@ -242,11 +236,10 @@ __global__ void scoringCUDA(uint64_t *sliceOffset, const uint64_t signaturesInSl
                      *      John Doench, 2016. 
                      *      https://www.nature.com/articles/nbt.3437
                     */
-                    double cfdScore = 0;
-                    if (dist == 0) {
-                        cfdScore = 1;
-                    }
-                    else if (dist > 0 && dist <= maxDist) {
+                    // dist == 0, cfdScore = 1
+                    double cfdScore = 1;
+                    // else
+                    if (dist > 0) {
                         cfdScore = cfdPamPenalties[0b1010]; // PAM: NGG, TODO: do not hard-code the PAM
                         
                         for (uint32_t pos = 0; pos < 20; pos++) {
@@ -365,14 +358,10 @@ int main(int argc, char **argv)
     }
     
     /** Char to binary encoding */
-    nucleotideIndex['A'] = 0;
-    nucleotideIndex['C'] = 1;
-    nucleotideIndex['G'] = 2;
-    nucleotideIndex['T'] = 3;
-    signatureIndex[0] = 'A';
-    signatureIndex[1] = 'C';
-    signatureIndex[2] = 'G';
-    signatureIndex[3] = 'T';
+    // nucleotideIndex['A'] = 0;
+    // nucleotideIndex['C'] = 1;
+    // nucleotideIndex['G'] = 2;
+    // nucleotideIndex['T'] = 3;
 
     /** The maximum number of mismatches */
     unsigned int maxDist = atoi(argv[3]);
