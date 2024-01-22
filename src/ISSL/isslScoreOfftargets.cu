@@ -17,10 +17,6 @@ Consider using native compilation for the best performance on your system:
 
 */
 
-// An attempt to fix the fread issues, but it doesn't seem to work
-#define _LARGEFILE_SOURCE 1
-#define _FILE_OFFSET_BITS 64
-
 #include "cfdPenalties.h"
 
 #include <cstdio>
@@ -489,7 +485,7 @@ int main(int argc, char **argv)
         size_t cuda_mem_free, cuda_mem_total;
         gpuErrChk(cudaMemGetInfo(&cuda_mem_free, &cuda_mem_total));
 
-        if (offtargetsCount > (cuda_mem_free/2)) {  // (/2) Leave space for the signatures
+        if ((offtargetsCount * sizeof(uint64_t)) > (cuda_mem_free/2)) {  // (/2) Leave space for the signatures
             // Not enough VRAM
             fprintf(stderr, "Not enough VRAM, using CUDA managed memory for offtargets\n");
             fprintf(stderr, "%zuMB Required\n", offtargetsCount * sizeof(uint64_t) / (1024*1024));
@@ -552,7 +548,7 @@ int main(int argc, char **argv)
         size_t cuda_mem_free, cuda_mem_total;
         gpuErrChk(cudaMemGetInfo(&cuda_mem_free, &cuda_mem_total));
         
-        // FIXME: fread below seems to fail a lot when reading large files
+        // fread below seems to fail a lot when reading 4GB+ of signatures, so we read them in 1GB chunks instead
         size_t allSignaturesSize = seqCount * sliceCount * sizeof(uint64_t);
         signaturesLowMem = allSignaturesSize > cuda_mem_free;
         if (signaturesLowMem) {
@@ -562,23 +558,42 @@ int main(int argc, char **argv)
 
             // cudaMallocManaged(&allSignatures, allSignaturesSize);
             allSignatures = (uint64_t*)malloc(allSignaturesSize);
-            if (fread(allSignatures, sizeof(uint64_t), allSignaturesSize, fp) == 0 || ferror(fp)) {
-                perror("Error reading index: reading slice contents failed");
-                return 1;
+
+            const size_t chunkSize = 1024 * 1024 * 1024 / sizeof(uint64_t); // 1GB in terms of uint64_t elements
+            size_t totalSize = 0;
+            for (size_t i = 0; i < allSignaturesSize && !feof(fp); i += chunkSize) {
+                size_t elementsToRead = min(chunkSize, allSignaturesSize - i);
+
+                size_t elementsRead = fread(allSignatures + i, sizeof(uint64_t), elementsToRead, fp);
+                totalSize += elementsRead;
+                if (elementsRead == 0 || ferror(fp)) {
+                    perror("Error reading index: reading slice contents failed");
+                    return 1;
+                }
             }
+
+            // Shrink the array to the actual size
+            allSignatures = (uint64_t*)realloc(allSignatures, totalSize * sizeof(uint64_t));
+
         } else {
             // Enough VRAM, use device memory
             gpuErrChk(cudaMalloc(&allSignatures, allSignaturesSize));
 
-            vector<uint64_t> allSignaturesTemp(seqCount * sliceCount);
-            if (fread(allSignaturesTemp.data(), sizeof(uint64_t), allSignaturesSize, fp) == 0 || ferror(fp)) {
-                perror("Error reading index: reading slice contents failed");
-                return 1;
-            }
-            // Can't use Async here, since the vector will be destroyed after this scope
-            gpuErrChk(cudaMemcpy(allSignatures, allSignaturesTemp.data(), allSignaturesSize, cudaMemcpyHostToDevice));
+            const size_t chunkSize = 1024 * 1024 * 1024 / sizeof(uint64_t); // 1GB in terms of uint64_t elements
+            vector<uint64_t> buffer(chunkSize);
 
-            // TODO: Read in chunks
+            for (size_t i = 0; i < allSignaturesSize && !feof(fp); i += chunkSize) {
+                size_t elementsToRead = min(chunkSize, allSignaturesSize - i);
+
+                size_t elementsRead = fread(buffer.data(), sizeof(uint64_t), elementsToRead, fp);
+                if (elementsRead == 0 || ferror(fp)) {
+                    perror("Error reading index: reading slice contents failed");
+                    return 1;
+                }
+
+                // Can't use Async here, since the data will be overwritten after this iteration
+                gpuErrChk(cudaMemcpy(allSignatures + i, buffer.data(), elementsRead * sizeof(uint64_t), cudaMemcpyHostToDevice));
+            }
         }
     }
 
@@ -771,7 +786,7 @@ int main(int argc, char **argv)
             
             size_t signaturesInSlice = allSlicelistSizes[idx];
 
-            uint64_t *sliceOffset = signaturesLowMem ? &d_someSignatures[i * searchSlice] : sliceLists[i][searchSlice];
+            uint64_t *sliceOffset = signaturesLowMem ? (d_someSignatures + i * maxSliceSize) : sliceLists[i][searchSlice];
 
             // Check last run to see if we should continue, also syncs the stream
             gpuErrChk(cudaDeviceSynchronize());
