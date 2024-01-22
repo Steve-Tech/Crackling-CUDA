@@ -17,6 +17,10 @@ Consider using native compilation for the best performance on your system:
 
 */
 
+// An attempt to fix the fread issues, but it doesn't seem to work
+#define _LARGEFILE_SOURCE 1
+#define _FILE_OFFSET_BITS 64
+
 #include "cfdPenalties.h"
 
 #include <cstdio>
@@ -236,7 +240,7 @@ __global__ void scoringCUDA(uint64_t *sliceOffset, const uint64_t signaturesInSl
                      *      John Doench, 2016. 
                      *      https://www.nature.com/articles/nbt.3437
                     */
-                    // dist == 0, cfdScore = 1
+                    // if dist == 0: cfdScore = 1, but without the branch
                     double cfdScore = 1;
                     // else
                     if (dist > 0) {
@@ -406,7 +410,7 @@ int main(int argc, char **argv)
      *      - slice list sizes
      *      - slice contents
      */
-    FILE *fp = fopen(argv[1], "rb");
+    FILE *fp = fopen64(argv[1], "rb");
     
     /** The index contains a fixed-sized header 
      *      - the number of off-targets in the index
@@ -418,8 +422,8 @@ int main(int argc, char **argv)
      */
     vector<size_t> slicelistHeader(6);
     
-    if (fread(slicelistHeader.data(), sizeof(size_t), slicelistHeader.size(), fp) == 0) {
-        fprintf(stderr, "Error reading index: header invalid\n");
+    if (fread(slicelistHeader.data(), sizeof(size_t), slicelistHeader.size(), fp) == 0 || ferror(fp)) {
+        perror("Error reading index: header invalid");
         return 1;
     }
     
@@ -432,8 +436,8 @@ int main(int argc, char **argv)
 
     // Create a CUDA stream for async operations, hardware also has a seperate queue for device-to-host
     cudaStream_t stream, streamD2H;
-    cudaStreamCreate(&stream);
-    cudaStreamCreate(&streamD2H);
+    gpuErrChk(cudaStreamCreate(&stream));
+    gpuErrChk(cudaStreamCreate(&streamD2H));
     
     /** The maximum number of possibly slice identities
      *      4 chars per slice * each of A,T,C,G = limit of 16
@@ -483,7 +487,7 @@ int main(int argc, char **argv)
 
     {
         size_t cuda_mem_free, cuda_mem_total;
-        cudaMemGetInfo(&cuda_mem_free, &cuda_mem_total);
+        gpuErrChk(cudaMemGetInfo(&cuda_mem_free, &cuda_mem_total));
 
         if (offtargetsCount > (cuda_mem_free/2)) {  // (/2) Leave space for the signatures
             // Not enough VRAM
@@ -492,8 +496,8 @@ int main(int argc, char **argv)
 
             gpuErrChk(cudaMallocManaged(&offtargets, offtargetsCount * sizeof(uint64_t)));
 
-            if (fread(offtargets, sizeof(uint64_t), offtargetsCount, fp) == 0) {
-                fprintf(stderr, "Error reading index: loading off-target sequences failed\n");
+            if (fread(offtargets, sizeof(uint64_t), offtargetsCount, fp) == 0 || ferror(fp)) {
+                perror("Error reading index: loading off-target sequences failed");
                 return 1;
             }
         } else {
@@ -501,8 +505,8 @@ int main(int argc, char **argv)
             gpuErrChk(cudaMalloc(&offtargets, offtargetsCount * sizeof(uint64_t)));
 
             vector<uint64_t> offtargetsTemp(offtargetsCount);
-            if (fread(offtargetsTemp.data(), sizeof(uint64_t), offtargetsCount, fp) == 0) {
-                fprintf(stderr, "Error reading index: loading off-target sequences failed\n");
+            if (fread(offtargetsTemp.data(), sizeof(uint64_t), offtargetsCount, fp) == 0 || ferror(fp)) {
+                perror("Error reading index: loading off-target sequences failed");
                 return 1;
             }
 
@@ -528,8 +532,8 @@ int main(int argc, char **argv)
      */
     vector<size_t> allSlicelistSizes(sliceCount * sliceLimit);
     
-    if (fread(allSlicelistSizes.data(), sizeof(size_t), allSlicelistSizes.size(), fp) == 0) {
-        fprintf(stderr, "Error reading index: reading slice list sizes failed\n");
+    if (fread(allSlicelistSizes.data(), sizeof(size_t), allSlicelistSizes.size(), fp) == 0 || ferror(fp)) {
+        perror("Error reading index: reading slice list sizes failed");
         return 1;
     }
     
@@ -546,8 +550,9 @@ int main(int argc, char **argv)
     bool signaturesLowMem;
     {
         size_t cuda_mem_free, cuda_mem_total;
-        cudaMemGetInfo(&cuda_mem_free, &cuda_mem_total);
-
+        gpuErrChk(cudaMemGetInfo(&cuda_mem_free, &cuda_mem_total));
+        
+        // FIXME: fread below seems to fail a lot when reading large files
         size_t allSignaturesSize = seqCount * sliceCount * sizeof(uint64_t);
         signaturesLowMem = allSignaturesSize > cuda_mem_free;
         if (signaturesLowMem) {
@@ -557,8 +562,8 @@ int main(int argc, char **argv)
 
             // cudaMallocManaged(&allSignatures, allSignaturesSize);
             allSignatures = (uint64_t*)malloc(allSignaturesSize);
-            if (fread(allSignatures, sizeof(uint64_t), allSignaturesSize, fp) == 0) {
-                fprintf(stderr, "Error reading index: reading slice contents failed\n");
+            if (fread(allSignatures, sizeof(uint64_t), allSignaturesSize, fp) == 0 || ferror(fp)) {
+                perror("Error reading index: reading slice contents failed");
                 return 1;
             }
         } else {
@@ -566,8 +571,8 @@ int main(int argc, char **argv)
             gpuErrChk(cudaMalloc(&allSignatures, allSignaturesSize));
 
             vector<uint64_t> allSignaturesTemp(seqCount * sliceCount);
-            if (fread(allSignaturesTemp.data(), sizeof(uint64_t), allSignaturesSize, fp) == 0) {
-                fprintf(stderr, "Error reading index: reading slice contents failed\n");
+            if (fread(allSignaturesTemp.data(), sizeof(uint64_t), allSignaturesSize, fp) == 0 || ferror(fp)) {
+                perror("Error reading index: reading slice contents failed");
                 return 1;
             }
             // Can't use Async here, since the vector will be destroyed after this scope
@@ -611,9 +616,18 @@ int main(int argc, char **argv)
     }
 
     if (signaturesLowMem) {
-        gpuErrChk(cudaMalloc(&d_someSignatures, maxSliceSize * sizeof(uint64_t) * sliceCount));
+        size_t cuda_mem_free, cuda_mem_total;
+        gpuErrChk(cudaMemGetInfo(&cuda_mem_free, &cuda_mem_total));
 
-        fprintf(stderr, "Allocated %zuMB chunks for signatures\n", maxSliceSize * sizeof(uint64_t) * sliceCount / (1024*1024));
+        if (cuda_mem_free < maxSliceSize * sizeof(uint64_t) * sliceCount) {
+            fprintf(stderr, "Not enough VRAM for signatures chunking\n");
+            fprintf(stderr, "%zuMB Required\n", maxSliceSize * sizeof(uint64_t) * sliceCount / (1024*1024));
+            return 1;
+        } else {
+            gpuErrChk(cudaMalloc(&d_someSignatures, maxSliceSize * sizeof(uint64_t) * sliceCount));
+
+            fprintf(stderr, "Allocated %zuMB chunks for signatures\n", maxSliceSize * sizeof(uint64_t) * sliceCount / (1024*1024));
+        }
         // TODO: Figure out what happens if this doesn't fit in VRAM
     }
     
@@ -661,7 +675,6 @@ int main(int argc, char **argv)
 
     // Calculate the signatures
     sequenceToSignatureCUDA<<<blockSize, gridSize>>>(queryCount, seqLength, d_queryDataSet, d_querySignatures);
-    gpuErrChk(cudaGetLastError());
 
     // Wait for CUDA to finish
     gpuErrChk(cudaDeviceSynchronize());
@@ -716,8 +729,6 @@ int main(int argc, char **argv)
     // Copy to constant memory
     gpuErrChk(cudaMemcpyToSymbolAsync(d_constant_args, &constant_args, sizeof(struct constScoringArgs), 0, cudaMemcpyHostToDevice, stream));
 
-    unordered_map<uint64_t, unordered_set<uint64_t>> searchResults;
-
     // Recalculate the block size for the scoring kernel
     gpuErrChk(cudaOccupancyMaxPotentialBlockSize(&gridSize, &blockSize, scoringCUDA, 0, maxSliceSize));
 
@@ -727,10 +738,10 @@ int main(int argc, char **argv)
         auto searchSignature = querySignatures[searchIdx];
 
         /** Global scores */
-        cudaMemsetAsync(d_totScoreMit, 0, sizeof(double), stream);  // totScoreMit = 0.0;
-        cudaMemsetAsync(d_totScoreCfd, 0, sizeof(double), stream);  // totScoreCfd = 0.0;
+        gpuErrChk(cudaMemsetAsync(d_totScoreMit, 0, sizeof(double), stream));  // totScoreMit = 0.0;
+        gpuErrChk(cudaMemsetAsync(d_totScoreCfd, 0, sizeof(double), stream));  // totScoreCfd = 0.0;
         
-        cudaMemsetAsync(d_numOffTargetSitesScored, 0, sizeof(int), stream);  // numOffTargetSitesScored = 0;
+        gpuErrChk(cudaMemsetAsync(d_numOffTargetSitesScored, 0, sizeof(int), stream));  // numOffTargetSitesScored = 0;
         double maximum_sum = (10000.0 - threshold*100) / threshold;
 
         *h_checkNextSlice = true;
@@ -741,14 +752,14 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < sliceCount; i++) {
             uint64_t sliceMask = sliceLimit - 1;
             size_t sliceShift = sliceWidth * i;
-            sliceMask = sliceMask << sliceShift;
+            sliceMask <<= sliceShift;
             
             uint64_t searchSlice = (searchSignature & sliceMask) >> sliceShift;
             searchSlices[i] = searchSlice;
 
             if (signaturesLowMem) {
-                cudaMemcpyAsync(d_someSignatures + i * maxSliceSize, sliceLists[i][searchSlice],
-                allSlicelistSizes[i * sliceLimit + searchSlice] * sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
+                gpuErrChk(cudaMemcpyAsync(d_someSignatures + i * maxSliceSize, sliceLists[i][searchSlice],
+                allSlicelistSizes[i * sliceLimit + searchSlice] * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
             }
         }
 
@@ -760,28 +771,27 @@ int main(int argc, char **argv)
             
             size_t signaturesInSlice = allSlicelistSizes[idx];
 
-            uint64_t *sliceOffset = signaturesLowMem ? (d_someSignatures + i * maxSliceSize) : sliceLists[i][searchSlice];
+            uint64_t *sliceOffset = signaturesLowMem ? &d_someSignatures[i * searchSlice] : sliceLists[i][searchSlice];
 
             // Check last run to see if we should continue, also syncs the stream
-            cudaDeviceSynchronize();
+            gpuErrChk(cudaDeviceSynchronize());
             if (!*h_checkNextSlice) {
                 break;
             }
-
-            scoringCUDA<<<blockSize, gridSize>>>(sliceOffset, signaturesInSlice, searchSignature, maximum_sum);
+            scoringCUDA<<<blockSize, gridSize, 0, stream>>>(sliceOffset, signaturesInSlice, searchSignature, maximum_sum);
             // Continue next iteration to prepare the next run
         }
-        cudaDeviceSynchronize();
+        gpuErrChk(cudaDeviceSynchronize());
 
         // memset(offtargetToggles.data(), 0, sizeof(uint64_t)*offtargetToggles.size());
-        cudaMemsetAsync(d_offtargetToggles, 0, numOfftargetToggles * sizeof(uint64_t), stream);
+        gpuErrChk(cudaMemsetAsync(d_offtargetToggles, 0, numOfftargetToggles * sizeof(uint64_t), stream));
 
         double totScoreMit = 0.0;
         double totScoreCfd = 0.0;
-        cudaMemcpyAsync(&totScoreMit, d_totScoreMit, sizeof(double), cudaMemcpyDeviceToHost, streamD2H);
-        cudaMemcpyAsync(&totScoreCfd, d_totScoreCfd, sizeof(double), cudaMemcpyDeviceToHost, streamD2H);
+        gpuErrChk(cudaMemcpyAsync(&totScoreMit, d_totScoreMit, sizeof(double), cudaMemcpyDeviceToHost, streamD2H));
+        gpuErrChk(cudaMemcpyAsync(&totScoreCfd, d_totScoreCfd, sizeof(double), cudaMemcpyDeviceToHost, streamD2H));
 
-        cudaStreamSynchronize(streamD2H);
+        gpuErrChk(cudaStreamSynchronize(streamD2H));
         querySignatureMitScores[searchIdx] = 10000.0 / (100.0 + totScoreMit);
         querySignatureCfdScores[searchIdx] = 10000.0 / (100.0 + totScoreCfd);
     }
