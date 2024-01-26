@@ -559,7 +559,7 @@ int main(int argc, char **argv)
             // cudaMallocManaged(&allSignatures, allSignaturesSize);
             allSignatures = (uint64_t*)malloc(allSignaturesSize);
 
-            const size_t chunkSize = 1024 * 1024 * 1024 / sizeof(uint64_t); // 1GB in terms of uint64_t elements
+            const uint64_t chunkSize = 2ull * 1024 * 1024 * 1024 / sizeof(uint64_t); // 2GB in terms of uint64_t elements
             size_t totalSize = 0;
             for (size_t i = 0; i < allSignaturesSize && !feof(fp); i += chunkSize) {
                 size_t elementsToRead = min(chunkSize, allSignaturesSize - i);
@@ -580,20 +580,26 @@ int main(int argc, char **argv)
             gpuErrChk(cudaMalloc(&allSignatures, allSignaturesSize));
 
             const size_t chunkSize = 1024 * 1024 * 1024 / sizeof(uint64_t); // 1GB in terms of uint64_t elements
-            vector<uint64_t> buffer(chunkSize);
+            // Double buffering, so data can be copied to the GPU while reading
+            vector<vector<uint64_t>> buffers(2, vector<uint64_t>(chunkSize));
 
             for (size_t i = 0; i < allSignaturesSize && !feof(fp); i += chunkSize) {
                 size_t elementsToRead = min(chunkSize, allSignaturesSize - i);
 
-                size_t elementsRead = fread(buffer.data(), sizeof(uint64_t), elementsToRead, fp);
+                size_t elementsRead = fread(buffers[i & 1].data(), sizeof(uint64_t), elementsToRead, fp);
                 if (elementsRead == 0 || ferror(fp)) {
                     perror("Error reading index: reading slice contents failed");
                     return 1;
                 }
 
-                // Can't use Async here, since the data will be overwritten after this iteration
-                gpuErrChk(cudaMemcpy(allSignatures + i, buffer.data(), elementsRead * sizeof(uint64_t), cudaMemcpyHostToDevice));
+                // Wait for previous buffer to be copied
+                gpuErrChk(cudaStreamSynchronize(stream));
+                // Copy the new buffer to the GPU
+                gpuErrChk(cudaMemcpyAsync(allSignatures + i, buffers[i & 1].data(), elementsRead * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
             }
+            // Wait for the last buffer to be copied
+            gpuErrChk(cudaStreamSynchronize(stream));
+            // The buffer vectors will be destroyed after this scope
         }
     }
 
